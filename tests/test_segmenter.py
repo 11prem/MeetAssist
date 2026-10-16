@@ -1,4 +1,5 @@
 import numpy as np, av, pytest
+from meetassist import paths
 from meetassist.segmenter import TrackSegmenter, RATE
 
 def load(path):
@@ -7,7 +8,7 @@ def load(path):
         for x in r.resample(f): out.append(x.to_ndarray().reshape(-1))
     return np.concatenate(out).astype(np.float32)/32768
 
-SAMPLE = r"C:\Users\prem.b\work\MeetAssist\audio\Recording.m4a"
+SAMPLE = paths.APP_ROOT / "audio" / "Recording.m4a"       # dev-only fixture, not committed - tests skip without it
 
 def run(audio, block):
     seg = TrackSegmenter("mic"); us = []
@@ -17,6 +18,7 @@ def run(audio, block):
 def test_silence_gives_nothing():
     assert run(np.zeros(RATE*10, np.float32), 1600) == []
 
+@pytest.mark.skipif(not SAMPLE.exists(), reason="dev-only audio fixture not present")
 def test_real_speech_is_cut_at_pauses_and_bounded():
     a = load(SAMPLE)
     us = run(a, 1600)
@@ -25,11 +27,13 @@ def test_real_speech_is_cut_at_pauses_and_bounded():
     assert all(b.start_s >= a_.end_s - 0.6 for a_, b in zip(us, us[1:]))      # ordered, ~non-overlapping
     assert all(0 <= u.start_s < u.end_s <= len(a)/RATE + 0.1 for u in us)
 
+@pytest.mark.skipif(not SAMPLE.exists(), reason="dev-only audio fixture not present")
 def test_block_size_independent():
     a = load(SAMPLE)[:RATE*60]
     x, y = run(a, 1600), run(a, 8000)
     assert abs(len(x) - len(y)) <= 1
 
+@pytest.mark.skipif(not SAMPLE.exists(), reason="dev-only audio fixture not present")
 def test_forced_cuts_do_not_overlap():
     a = load(SAMPLE)
     seg = TrackSegmenter("mic", max_s=6.0, min_silence_s=0.5); us = []

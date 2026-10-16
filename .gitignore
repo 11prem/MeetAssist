@@ -1,5 +1,5 @@
 models/
-data/
+/data/
 *.wav
 *.pcm
 *.m4a

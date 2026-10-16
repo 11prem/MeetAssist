@@ -1,0 +1,29 @@
+models/
+data/
+*.wav
+*.pcm
+*.m4a
+*.mp3
+audio/
+__pycache__/
+*.pyc
+.venv/
+runtime/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# build artifacts / packaged app - distribute via Releases, not source control
+*.exe
+
+# personal dev notes - not part of the public project
+todo.md
+
+# editor/OS cruft
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

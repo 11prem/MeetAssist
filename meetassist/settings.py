@@ -67,6 +67,7 @@ class Settings:
     appearance: str = "system"       # system | light | dark
     ack_notice: bool = False         # one-time recording-consent reminder shown
     record_mic: bool = True
+    voice_enroll_asked: bool = False  # one-time "record my voice" offer shown (Settings > Voices repeats it on request)
 
     @staticmethod
     def load() -> "Settings":

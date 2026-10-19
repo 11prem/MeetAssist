@@ -7,6 +7,7 @@ through files in the meeting folder, so a crash in either never takes the GUI do
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import threading
@@ -14,7 +15,9 @@ import time
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from . import export, paths, store
+import numpy as np
+
+from . import paths, store
 from .settings import Settings
 
 CREATE_NO_WINDOW = 0x08000000
@@ -53,6 +56,8 @@ class Controller:
         self.capture_failed = False
         self.refine_done: list = []                  # meetings whose refinement just finished (GUI drains this)
         self.refiners: dict = {}                     # meeting dir -> background 'refine' worker process
+        self.voiceid_done: list = []                  # (meeting dir, [unnamed speaker ids]) the GUI drains this
+        self._voiceid_running: set = set()
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ live recording
@@ -156,6 +161,48 @@ class Controller:
         self.active, self.capture = None, None
         return d
 
+    # ------------------------------------------------------------------ speaker voice recognition
+    def identify_voices(self, d: Path) -> None:
+        """Background pass (runs once per meeting, after transcription is done): embeds mic-track
+        speech and matches/clusters it against saved voice profiles. Never blocks the GUI."""
+        if d in self._voiceid_running:
+            return
+        self._voiceid_running.add(d)
+
+        def run() -> None:
+            from . import voiceid
+            try:
+                unnamed = voiceid.identify_speakers(d)
+            except Exception:
+                unnamed = []
+            self._row_cache.pop(d, None)                 # force a re-read so names show up immediately
+            self.voiceid_done.append((d, unnamed))
+            self._voiceid_running.discard(d)
+        threading.Thread(target=run, daemon=True).start()
+
+    def record_voice_sample(self, seconds: float) -> np.ndarray:
+        """Blocking: captures `seconds` of mic audio to a scratch folder (self-voice enrollment)
+        and returns it as float32 mono 16 kHz. Call this off the GUI thread. Reuses the same
+        capture subprocess as live recording rather than opening the microphone a second way."""
+        tmp = paths.DATA_DIR / "_voice_sample"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        args = ["--raw-dir", str(tmp), "--epoch", repr(time.time()), "--no-loop"]
+        if self.settings.mic_name:
+            args += ["--mic-name", self.settings.mic_name]
+        p = _spawn("meetassist.capture_proc", args, tmp / "capture.log")
+        time.sleep(seconds)
+        (tmp / "STOP").write_text("stop")
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+        pcm = tmp / "mic.pcm"
+        audio = (np.frombuffer(pcm.read_bytes(), dtype=np.int16).astype(np.float32) / 32768.0
+                 if pcm.exists() else np.zeros(0, np.float32))
+        shutil.rmtree(tmp, ignore_errors=True)
+        return audio
+
     def recover(self) -> List[Path]:
         """Meetings left open by a crash/power loss: finalise them so their worker can finish."""
         out = []
@@ -217,7 +264,7 @@ class Controller:
         c = self._row_cache.get(d)
         if c and c[0] == key:
             return c[1]
-        rows = export.read_journal(j)
+        rows = store.read_rows(d)
         self._row_cache[d] = (key, rows)
         return rows
 

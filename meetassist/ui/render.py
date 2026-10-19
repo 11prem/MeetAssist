@@ -19,7 +19,7 @@ def transcript_html(groups: List[dict], p: theme.Palette) -> str:
     out = []
     for g in groups:
         col = p.you if g["track"] == "mic" else p.remote if g["track"] == "loop" else p.text2
-        who = SPEAKER.get(g["track"], g["track"])
+        who = g.get("who") or SPEAKER.get(g["track"], g["track"])
         out.append(
             f"<div style='margin:0 0 20px 0'>"
             f"<p style='margin:0 0 3px 0'><span style='color:{col};font-weight:600;font-size:13px'>{who}</span>"
@@ -46,7 +46,7 @@ class ReadingView(QTextBrowser):
         super().__init__(parent)
         self.setFrameShape(QTextBrowser.Shape.NoFrame)
         self.setOpenLinks(False)
-        f = QFont(); f.setFamilies(["Segoe UI Variable Text", "Segoe UI", "Nirmala UI"]); f.setPixelSize(16)
+        f = QFont(); f.setFamilies(["Fraunces", "Segoe UI Variable Text", "Segoe UI", "Nirmala UI"]); f.setPixelSize(16)
         self.setFont(f)
         self.document().setDocumentMargin(0)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -87,7 +87,8 @@ def markdown_html(md: str, p: theme.Palette) -> str:
         if m:
             if in_list: out.append("</ul>"); in_list = False
             done = m.group(1).lower() == "x"
-            box = f"<span style='color:{p.accent if not done else p.success};font-size:17px'>{'&#9745;' if done else '&#9744;'}</span>"
+            box = (f"<span style='color:{p.accent if not done else p.success};font-size:17px;"
+                   f"font-family:\"Segoe UI Symbol\",\"Segoe UI\"'>{'&#9745;' if done else '&#9744;'}</span>")
             out.append(f"<p style='margin:0 0 9px 2px;line-height:150%;font-size:15px;color:{p.text}'>{box}&nbsp;&nbsp;{inline(m.group(2))}</p>")
             continue
         m = re.match(r"^\s*[-*]\s+(.*)", ln)

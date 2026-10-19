@@ -14,6 +14,8 @@ DATA_DIR = Path(os.environ.get("MEETASSIST_DATA_DIR", Path(os.environ.get("LOCAL
 MEETINGS_DIR = DATA_DIR / "meetings"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 LOG_FILE = DATA_DIR / "app.log"
+SPEAKER_MODEL = MODELS_DIR / "speaker-id" / "campplus_sv_zh_en_16k-common_advanced.onnx"
+VOICES_FILE = DATA_DIR / "voices.json"
 
 def ensure_dirs() -> None:
     MEETINGS_DIR.mkdir(parents=True, exist_ok=True)

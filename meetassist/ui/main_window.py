@@ -7,25 +7,30 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import QThread, QTimer, Qt, QUrl, Signal
+import numpy as np
+from PySide6.QtCore import QEasingCurve, QEvent, QThread, QTimer, Qt, QUrl, QVariantAnimation, Signal
 from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QGuiApplication, QKeySequence, QPixmap, QShortcut, QFont
 from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
-                               QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+                               QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
                                QStackedWidget, QVBoxLayout, QWidget)
 
-from .. import export, paths, store
+from .. import export, paths, store, voiceid
 from ..controller import Controller
 from ..llm import LLMClient
+from ..segmenter import RATE
 from ..settings import Settings
 from ..transcriber import available_models
 from . import theme
-from .icons import pixmap
+from .icons import icon as svg_icon, pixmap
+from .name_speaker_dialog import NameSpeakerDialog
 from .render import ReadingView, chat_html, markdown_html, placeholder_html, summary_css, transcript_html
-from .settings_dialog import SettingsDialog
+from .settings_dialog import SettingsDialog, _RecordVoice
 from .theme import SP, TYPE
-from .widgets import (ROLE_HEADER, ROLE_PATH, ROLE_STATE, ROLE_SUB, ROLE_TITLE, Banner, EmptyState, IconButton, JobIndicator,
-                      LabelButton, MeetingDelegate, MeterRow, RecordButton, Segmented, SideButton, SourceStatusLabel,
-                      StatusPill, Toast, WaveStrip, label, shadow)
+from .widgets import (ROLE_HEADER, ROLE_PATH, ROLE_STATE, ROLE_SUB, ROLE_TITLE, ActionBar, Banner, Composer, EmptyState,
+                      IconButton, JobIndicator, LabelButton, MeetingDelegate, MeterRow, PopButton, RecordButton,
+                      Segmented, SideButton, SourceStatusLabel, StatusPill, TitleBar, Toast, WaveStrip, label, shadow)
+
+RESIZE_MARGIN = 6
 
 DISPLAY_NAMES = {"english": "English", "roman": "Tanglish", "tamil": "Tamil"}
 
@@ -88,6 +93,7 @@ class MainWindow(QMainWindow):
         self._list_sig = None
         self._search = ""
         self.setWindowTitle("MeetAssist")
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)   # custom title bar below owns move/resize/min/max/close
         self.setMinimumSize(900, 540)
         self._fit_to_screen()
         self.tm = theme.init()
@@ -114,10 +120,42 @@ class MainWindow(QMainWindow):
         self.resize(max(w, 900), max(h, 540))
         self.move(av.left() + (av.width() - self.width()) // 2, av.top() + (av.height() - self.height()) // 2)
 
+    # ================================================================== frameless window: edge resize
+    def _edge_at(self, pos) -> tuple:
+        """left/right/bottom only: the body's own top margin is an internal gap below the title
+        bar, not a window edge, so top-edge resize isn't offered (drag a corner instead)."""
+        m = RESIZE_MARGIN
+        return pos.x() <= m, pos.x() >= self._body.width() - m, pos.y() >= self._body.height() - m
+
+    def eventFilter(self, obj, e) -> bool:
+        if obj is self._body:
+            if e.type() == QEvent.Type.MouseMove and not e.buttons():
+                left, right, bottom = self._edge_at(e.position().toPoint())
+                cur = (Qt.CursorShape.SizeBDiagCursor if (left and bottom) else
+                       Qt.CursorShape.SizeFDiagCursor if (right and bottom) else
+                       Qt.CursorShape.SizeHorCursor if (left or right) else
+                       Qt.CursorShape.SizeVerCursor if bottom else Qt.CursorShape.ArrowCursor)
+                self._body.setCursor(cur)
+            elif e.type() == QEvent.Type.MouseButtonPress and e.button() == Qt.MouseButton.LeftButton:
+                left, right, bottom = self._edge_at(e.position().toPoint())
+                if left or right or bottom:
+                    edges = Qt.Edge(0)
+                    if left: edges |= Qt.Edge.LeftEdge
+                    if right: edges |= Qt.Edge.RightEdge
+                    if bottom: edges |= Qt.Edge.BottomEdge
+                    wh = self.windowHandle()
+                    if wh is not None:
+                        wh.startSystemResize(edges); return True
+        return super().eventFilter(obj, e)
+
     # ================================================================== construction
     def _build(self) -> None:
-        central = QWidget(); self.setCentralWidget(central)
-        root = QHBoxLayout(central); root.setContentsMargins(0, 0, 0, 0); root.setSpacing(0)
+        central = QWidget(); central.setObjectName("mainbg"); self.setCentralWidget(central)
+        outer = QVBoxLayout(central); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+        self.titlebar = TitleBar(); outer.addWidget(self.titlebar)
+        self._body = QWidget(); self._body.setMouseTracking(True); self._body.installEventFilter(self)
+        outer.addWidget(self._body, 1)
+        root = QHBoxLayout(self._body); root.setContentsMargins(SP["md"], SP["md"], SP["md"], SP["md"]); root.setSpacing(SP["md"])
 
         # ------------------------------------------------ sidebar
         side = QWidget(); side.setObjectName("sidebar"); side.setFixedWidth(300)
@@ -129,7 +167,11 @@ class MainWindow(QMainWindow):
         self.search = QLineEdit(); self.search.setPlaceholderText("Search meetings"); self.search.setClearButtonEnabled(True)
         self.search.setAccessibleName("Search meetings"); self.search.textChanged.connect(self._on_search)
         sv.addWidget(self.search)
-        self.listw = QListWidget(); self.listw.setItemDelegate(MeetingDelegate(self.listw)); self.listw.setMouseTracking(True)
+        self.listw = QListWidget(); self.list_delegate = MeetingDelegate(self.listw)
+        self.listw.setItemDelegate(self.list_delegate); self.listw.setMouseTracking(True)
+        self._row_hover_anim = QVariantAnimation(self, duration=160, easingCurve=QEasingCurve.Type.OutBack)
+        self._row_hover_anim.valueChanged.connect(self._on_row_hover_scale)
+        self.listw.entered.connect(self._on_row_entered); self.listw.viewportEntered.connect(self._on_row_left)
         self.listw.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.listw.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel); self.listw.setAccessibleName("Meetings")
         self.listw.currentItemChanged.connect(self._on_select)
@@ -144,14 +186,14 @@ class MainWindow(QMainWindow):
 
         # ------------------------------------------------ content
         content = QWidget(); content.setObjectName("content"); root.addWidget(content, 1)
-        cv = QVBoxLayout(content); cv.setContentsMargins(0, 0, 0, 0); cv.setSpacing(0)
+        cv = QVBoxLayout(content); cv.setContentsMargins(0, 0, 0, 0); cv.setSpacing(SP["md"])
         self.pages = QStackedWidget(); cv.addWidget(self.pages, 1)
 
         # page 0: empty state
         self.empty = EmptyState("waveform", "Record your first meeting",
                                 "MeetAssist captures your microphone and everyone on the call, then writes the transcript on this computer — "
                                 "Tamil, English and Tanglish. Nothing leaves your laptop.")
-        self.empty_import = QPushButton("Import an audio file…"); self.empty_import.clicked.connect(self.import_audio)
+        self.empty_import = PopButton("Import an audio file…"); self.empty_import.clicked.connect(self.import_audio)
         self.empty.actions.addWidget(self.empty_import)
         self.pages.addWidget(self.empty)
 
@@ -189,10 +231,9 @@ class MainWindow(QMainWindow):
         self.views = QStackedWidget(); pv.addWidget(self.views, 1)
         raw_page = QWidget(); raw_v = QVBoxLayout(raw_page); raw_v.setContentsMargins(0, 0, 0, 0); raw_v.setSpacing(SP["sm"])
         self.view_raw = ReadingView(); raw_v.addWidget(self.view_raw, 1)
-        rrow = QHBoxLayout(); rrow.addStretch()
-        self.b_clean = QPushButton("Clean up"); self.b_clean.clicked.connect(lambda: self.run_clean())
-        rrow.addWidget(self.b_clean)
-        raw_v.addLayout(rrow)
+        self.b_clean = PopButton("Clean up"); self.b_clean.setProperty("variant", "primary")
+        self.b_clean.setIcon(svg_icon("sparkles", theme.P().on_accent)); self.b_clean.clicked.connect(lambda: self.run_clean())
+        raw_v.addWidget(ActionBar(self.b_clean))
         self.views.addWidget(raw_page)
 
         clean_page = QWidget(); clean_v = QVBoxLayout(clean_page); clean_v.setContentsMargins(0, 0, 0, 0); clean_v.setSpacing(SP["sm"])
@@ -202,10 +243,9 @@ class MainWindow(QMainWindow):
                                            "here - fix anything the AI got wrong (misheard names, jargon, etc.) directly in this box.")
         self.view_clean.textChanged.connect(self._on_clean_edited)
         clean_v.addWidget(self.view_clean, 1)
-        crow = QHBoxLayout(); crow.addStretch()
-        self.b_summarize = QPushButton("Summarize"); self.b_summarize.clicked.connect(lambda: self.run_summary())
-        crow.addWidget(self.b_summarize)
-        clean_v.addLayout(crow)
+        self.b_summarize = PopButton("Summarize"); self.b_summarize.setProperty("variant", "primary")
+        self.b_summarize.setIcon(svg_icon("sparkles", theme.P().on_accent)); self.b_summarize.clicked.connect(lambda: self.run_summary())
+        clean_v.addWidget(ActionBar(self.b_summarize))
         self.views.addWidget(clean_page)
 
         sum_page = QWidget(); sum_v = QVBoxLayout(sum_page); sum_v.setContentsMargins(0, 0, 0, 0); sum_v.setSpacing(SP["sm"])
@@ -216,20 +256,16 @@ class MainWindow(QMainWindow):
         self.view_sum.textChanged.connect(self._on_summary_edited)
         self.sum_views.addWidget(self.view_sum)
         sum_v.addWidget(self.sum_views, 1)
-        srow = QHBoxLayout(); srow.addStretch()
-        self.b_sum_edit = QPushButton("Edit"); self.b_sum_edit.clicked.connect(self._toggle_summary_edit)
-        srow.addWidget(self.b_sum_edit)
-        sum_v.addLayout(srow)
+        self.b_sum_edit = PopButton("Edit"); self.b_sum_edit.clicked.connect(self._toggle_summary_edit)
+        sum_v.addWidget(ActionBar(self.b_sum_edit))
         self.views.addWidget(sum_page)
 
         ask_page = QWidget(); ask_v = QVBoxLayout(ask_page); ask_v.setContentsMargins(0, 0, 0, 0); ask_v.setSpacing(SP["sm"])
         self.chat_log = ReadingView(); ask_v.addWidget(self.chat_log, 1)
-        qrow = QHBoxLayout(); qrow.setSpacing(SP["sm"])
-        self.chat_input = QLineEdit(); self.chat_input.setPlaceholderText("Ask a question about this meeting…")
-        self.chat_input.setAccessibleName("Ask about this meeting"); self.chat_input.returnPressed.connect(self._ask_question)
-        self.b_ask = QPushButton("Ask"); self.b_ask.clicked.connect(self._ask_question)
-        qrow.addWidget(self.chat_input, 1); qrow.addWidget(self.b_ask)
-        ask_v.addLayout(qrow)
+        self.composer = Composer("Ask a question about this meeting…")
+        self.composer.input.setAccessibleName("Ask about this meeting")
+        self.composer.send.connect(self._ask_question)
+        ask_v.addWidget(self.composer)
         self.views.addWidget(ask_page)
 
         self._chat_history: List[dict] = []
@@ -306,9 +342,28 @@ class MainWindow(QMainWindow):
         if not self._models_ok():
             QMessageBox.critical(self, "Speech model missing",
                                  f"No speech-recognition model was found in:\n{paths.MODELS_DIR}\n\nCopy the 'models' folder next to the application.")
+            return
+        self._maybe_offer_voice_enrollment()
+
+    def _maybe_offer_voice_enrollment(self) -> None:
+        """One-time, on first run: offer to learn the user's voice so MeetAssist never has to ask
+        who they are, even in an in-person meeting where everyone shares one microphone."""
+        if self.settings.voice_enroll_asked or any(p["id"] == voiceid.ME_ID for p in voiceid.load_profiles()):
+            return
+        self.settings.voice_enroll_asked = True
+        self.settings.save()
+        if QMessageBox.question(self, "Recognise your voice",
+                                "MeetAssist can learn your voice once so it never has to ask who you are later - "
+                                "even in an in-person meeting where everyone is heard through the same microphone.\n\n"
+                                "Record a 10-second sample now? You can also do this later in Settings → Voices.",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            self._toast("Recording your voice for 10 seconds…")
+            self._enroll = _RecordVoice(self.ctrl)
+            self._enroll.done.connect(lambda ok: self._toast("Voice saved" if ok else "Could not record your voice"))
+            self._enroll.start()
 
     def open_settings(self) -> None:
-        dlg = SettingsDialog(self.settings, self)
+        dlg = SettingsDialog(self.settings, self.ctrl, self)
         if dlg.exec():
             self.settings.save(); self.ctrl.settings = self.settings
             self.tm.set_mode(self.settings.appearance)
@@ -439,6 +494,25 @@ class MainWindow(QMainWindow):
             self.current = Path(item.data(ROLE_PATH)); self._row_count = -1
             self._load_side_files(); self.refresh()
 
+    def _on_row_entered(self, index) -> None:
+        path = index.data(ROLE_PATH)
+        if not path or path == self.list_delegate.hover_path:
+            return
+        self.list_delegate.hover_path = path
+        self._row_hover_anim.stop(); self._row_hover_anim.setStartValue(self.list_delegate.hover_scale)
+        self._row_hover_anim.setEndValue(1.05); self._row_hover_anim.start()
+
+    def _on_row_left(self) -> None:
+        if self.list_delegate.hover_path is None:
+            return
+        self.list_delegate.hover_path = None
+        self._row_hover_anim.stop(); self._row_hover_anim.setStartValue(self.list_delegate.hover_scale)
+        self._row_hover_anim.setEndValue(1.0); self._row_hover_anim.start()
+
+    def _on_row_hover_scale(self, v) -> None:
+        self.list_delegate.hover_scale = v
+        self.listw.viewport().update()
+
     def _list_menu(self, pos) -> None:
         it = self.listw.itemAt(pos)
         if not it or not it.data(ROLE_PATH):
@@ -512,6 +586,12 @@ class MainWindow(QMainWindow):
             if r == self.current:
                 self._row_count = -1; self._load_side_files()
             self._postprocess(r)
+        while self.ctrl.voiceid_done:
+            r, unnamed = self.ctrl.voiceid_done.pop(0)
+            if unnamed:
+                self._prompt_speaker_names(r, unnamed)
+            if r == self.current:
+                self._row_count = -1
         d = self.current
         self.pages.setCurrentIndex(1 if d else 0)
         if not d:
@@ -571,12 +651,41 @@ class MainWindow(QMainWindow):
 
     def _on_done(self, d: Path) -> None:
         meta = store.read_meta(d)
+        self.ctrl.identify_voices(d)
         rm = self.settings.refine_model
         if (rm and rm != meta.get("model") and rm in available_models(paths.MODELS_DIR)
                 and not meta.get("refined") and not meta.get("refine_pending") and d not in self.ctrl.refiners):
             self.ctrl.start_refine(d, rm)
             return
         self._postprocess(d)
+
+    def _prompt_speaker_names(self, d: Path, unnamed: List[str]) -> None:
+        """A new, not-yet-recognised voice was heard in this meeting: show what they said (and let
+        the user play back a short clip of their voice) before asking what to call it, so it's
+        recognised automatically from now on - a bare timestamp isn't enough to tell who it was."""
+        rows, speakers = store.read_rows(d), store.read_speakers(d)
+        by_speaker: dict = {}
+        for r in rows:
+            pid = speakers.get(r.get("seq"))
+            if pid in unnamed:
+                by_speaker.setdefault(pid, []).append(r)
+        title = store.read_meta(d).get("title", d.name)
+        pcm_path = d / "raw" / "mic.pcm"
+        pcm = np.memmap(pcm_path, dtype=np.int16, mode="r") if pcm_path.exists() else None
+        for pid in unnamed:
+            turns = by_speaker.get(pid, [])
+            if not turns:
+                continue
+            longest = max(turns, key=lambda r: r["t_end"] - r["t_start"])
+            text = " ".join(t.get("text", "") for t in turns[:3]).strip()[:220]
+            audio = None
+            if pcm is not None:
+                a, b = int(longest["t_start"] * RATE), min(int(longest["t_end"] * RATE), len(pcm))
+                if b > a:
+                    audio = pcm[a:b].astype(np.float32) / 32768.0
+            dlg = NameSpeakerDialog(title, fmt_dur(longest["t_start"]), text, audio, self)
+            if dlg.exec() and dlg.name():
+                voiceid.rename_profile(pid, dlg.name())
 
     def _postprocess(self, d: Path) -> None:
         if self.settings.auto_postprocess and self._llm().available and not (d / "cleaned.json").exists():
@@ -599,7 +708,7 @@ class MainWindow(QMainWindow):
         if tp.exists():
             return tp.read_text(encoding="utf-8")
         cl = store.read_json(d / "cleaned.json")
-        rows = export.read_journal(d / "journal.jsonl")
+        rows = store.read_rows(d)
         if cl:
             return export.render_txt(rows, "cleaned", {int(k): v for k, v in cl.items()}, roman=self.settings.tamil_display)
         return ""
@@ -696,7 +805,7 @@ class MainWindow(QMainWindow):
         d = d if isinstance(d, Path) else self.current
         if not d or not self._need_llm():
             return
-        rows = export.read_journal(d / "journal.jsonl"); client = self._llm(); mode = self.settings.tamil_display
+        rows = store.read_rows(d); client = self._llm(); mode = self.settings.tamil_display
 
         def work(progress):
             if mode == "english":
@@ -726,21 +835,21 @@ class MainWindow(QMainWindow):
         self._run_job(work, lambda _: (self._load_side_files(), self.seg.set_current(2)) if d == self.current else None, "Summarising")
 
     def _ask_context(self, d: Path) -> str:
-        text = self._cleaned_text(d) or export.render_txt(export.read_journal(d / "journal.jsonl"), roman=self.settings.tamil_display)
+        text = self._cleaned_text(d) or export.render_txt(store.read_rows(d), roman=self.settings.tamil_display)
         sp = d / "summary.md"
         if sp.exists():
             text += "\n\n## Summary\n" + sp.read_text(encoding="utf-8")
         return text
 
-    def _ask_question(self) -> None:
+    def _ask_question(self, q: str) -> None:
         d = self.current
-        q = self.chat_input.text().strip()
+        q = q.strip()
         if not d or not q or not self._need_llm():
             return
         client = self._llm(); context = self._ask_context(d)
         history = list(self._chat_history)                   # local snapshot: isolated from whatever meeting is current later
         convo = history + [{"role": "user", "content": q}]
-        self.chat_input.clear()
+        self.composer.clear()
         self._chat_history = convo; self._render_chat()
 
         def work(progress):
@@ -777,7 +886,7 @@ class MainWindow(QMainWindow):
             text = self._cleaned_text(d)
             if text:
                 return text
-        return export.render_txt(export.read_journal(d / "journal.jsonl"), roman=self.settings.tamil_display)
+        return export.render_txt(store.read_rows(d), roman=self.settings.tamil_display)
 
     def copy_text(self) -> None:
         if not self.current:
@@ -790,7 +899,7 @@ class MainWindow(QMainWindow):
         if not d:
             return
         self._flush_edits()                       # make sure cleaned.txt / summary.md are current before export
-        meta = store.read_meta(d); rows = export.read_journal(d / "journal.jsonl")
+        meta = store.read_meta(d); rows = store.read_rows(d)
         cl = store.read_json(d / "cleaned.json"); cleaned = {int(k): v for k, v in cl.items()} if cl else None
         variant = "cleaned" if (cleaned and self.seg.current() == 1) else "raw"
         sp = d / "summary.md"; summary = sp.read_text(encoding="utf-8") if sp.exists() else ""

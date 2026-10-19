@@ -7,7 +7,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -77,6 +77,29 @@ def delete_meeting(d: Path) -> None:
     # AGENTS rule 2: raw audio is only ever removed on an explicit user action (this function).
     if d.resolve().parent == paths.MEETINGS_DIR.resolve():
         shutil.rmtree(d, ignore_errors=True)
+
+
+def read_speakers(d: Path) -> Dict[int, str]:
+    """<meeting>/speakers.json: seq -> recognised voice-profile id (written by voiceid.identify_speakers)."""
+    data = read_json(d / "speakers.json") or {}
+    return {int(k): v for k, v in data.items()}
+
+
+def write_speakers(d: Path, mapping: Dict[int, str]) -> None:
+    tmp = d / "speakers.tmp"
+    tmp.write_text(json.dumps({str(k): v for k, v in mapping.items()}, indent=2), encoding="utf-8")
+    os.replace(tmp, d / "speakers.json")
+
+
+def read_rows(d: Path, hide_echo: bool = True) -> List[dict]:
+    """Journal rows with recognised speaker names attached, for display - the usual way to read
+    a meeting's transcript (see export.read_journal for the raw, speaker-less parse)."""
+    from . import export, voiceid
+    rows = export.read_journal(d / "journal.jsonl", hide_echo)
+    speakers = read_speakers(d)
+    if speakers:
+        export.attach_speakers(rows, speakers, voiceid.profile_names())
+    return rows
 
 
 def audio_seconds(d: Path) -> float:

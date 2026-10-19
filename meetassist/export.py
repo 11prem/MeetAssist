@@ -85,6 +85,16 @@ def _text(r: dict, variant: str, cleaned: Optional[Dict[int, str]], disp=False) 
     return tamil.romanize(t) if mode in ("roman", "english") else t
 
 
+def attach_speakers(rows: List[dict], speakers: Dict[int, str], names: Dict[str, str]) -> List[dict]:
+    """Add a 'who' field (resolved display name) to rows with a named, recognised voice. Rows with
+    no recognised/named speaker are untouched and keep falling back to the mic/loop track label."""
+    for r in rows:
+        name = names.get(speakers.get(r.get("seq")))
+        if name:
+            r["who"] = name
+    return rows
+
+
 def group_rows(rows: Iterable[dict], variant="raw", cleaned=None, max_gap=4.0, max_chars=700, roman=False) -> List[dict]:
     """Merge consecutive same-speaker pieces (gap <= max_gap s) into paragraphs for reading."""
     groups: List[dict] = []
@@ -92,18 +102,19 @@ def group_rows(rows: Iterable[dict], variant="raw", cleaned=None, max_gap=4.0, m
         t = _text(r, variant, cleaned, roman).strip()
         if not t:
             continue
+        who = r.get("who")
         g = groups[-1] if groups else None
-        if (g and g["track"] == r["track"] and (roman == "english" or g.get("lang") == r.get("lang"))
+        if (g and g["track"] == r["track"] and g.get("who") == who and (roman == "english" or g.get("lang") == r.get("lang"))
                 and r["t_start"] - g["t_end"] <= max_gap and len(g["text"]) < max_chars):
             g["text"] += " " + t
             g["t_end"] = max(g["t_end"], r["t_end"])
         else:
-            groups.append({"track": r["track"], "t_start": r["t_start"], "t_end": r["t_end"], "text": t, "lang": r.get("lang")})
+            groups.append({"track": r["track"], "who": who, "t_start": r["t_start"], "t_end": r["t_end"], "text": t, "lang": r.get("lang")})
     return groups
 
 
 def render_txt(rows: Iterable[dict], variant="raw", cleaned=None, labels=LABELS, roman=False) -> str:
-    out = [f"[{hms(g['t_start'])}] [{labels.get(g['track'], g['track'])}] {g['text']}"
+    out = [f"[{hms(g['t_start'])}] [{g['who'] or labels.get(g['track'], g['track'])}] {g['text']}"
            for g in group_rows(rows, variant, cleaned, roman=roman)]
     return "\n".join(out) + "\n"
 
@@ -116,7 +127,7 @@ def render_srt(rows: Iterable[dict], variant="raw", cleaned=None, labels=LABELS,
             continue
         n += 1
         out.append(f"{n}\n{srt_ts(r['t_start'])} --> {srt_ts(max(r['t_end'], r['t_start'] + 0.5))}\n"
-                   f"{labels.get(r['track'], r['track'])}: {t}\n")
+                   f"{r.get('who') or labels.get(r['track'], r['track'])}: {t}\n")
     return "\n".join(out)
 
 
@@ -128,6 +139,6 @@ def render_md(rows: List[dict], meta: dict, variant="raw", cleaned=None, summary
     if summary.strip():
         head += [summary.strip(), ""]
     head += ["## Transcript", ""]
-    body = [f"**[{hms(g['t_start'])}] {labels.get(g['track'], g['track'])}:** {g['text']}\n"
+    body = [f"**[{hms(g['t_start'])}] {g['who'] or labels.get(g['track'], g['track'])}:** {g['text']}\n"
             for g in group_rows(rows, variant, cleaned, roman=roman)]
     return "\n".join(head + body) + "\n"

@@ -8,7 +8,8 @@ from typing import List, Optional
 from PySide6.QtCore import (QEasingCurve, QPointF, QPropertyAnimation, QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal)
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen)
 from PySide6.QtWidgets import (QAbstractButton, QFrame, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QHBoxLayout,
-                               QLabel, QSizePolicy, QStyle, QStyledItemDelegate, QToolButton, QVBoxLayout, QWidget)
+                               QLabel, QLineEdit, QPushButton, QSizePolicy, QStyle, QStyleOptionButton,
+                               QStyledItemDelegate, QToolButton, QVBoxLayout, QWidget)
 
 from . import icons, theme
 from .theme import MOTION, RADIUS, SP, TYPE
@@ -40,7 +41,119 @@ def reduced_motion() -> bool:
     return False          # hook: honour Windows "show animations" later; all animations are short and optional
 
 
+# ----------------------------------------------------------------------------- custom title bar (frameless window)
+def hover_pop(widget: QWidget, duration: int = 180, target: float = 1.3) -> QVariantAnimation:
+    """Shared hover micro-interaction: a 1.0 -> target scale pop with an overshoot easing (enlarge, not
+    move), wired to the widget's enter/leaveEvent. The widget owns a `_scale` float its paintEvent must
+    apply (translate to centre, scale, translate back) before drawing; `update()` runs on every tick."""
+    anim = QVariantAnimation(widget, duration=duration, easingCurve=QEasingCurve.Type.OutBack)
+    widget._scale = 1.0
+    anim.valueChanged.connect(lambda v: (setattr(widget, "_scale", v), widget.update()))
+    widget._pop_anim = anim
+
+    def enter(e, _orig=widget.enterEvent):
+        anim.stop(); anim.setStartValue(widget._scale); anim.setEndValue(target); anim.start()
+        _orig(e)
+
+    def leave(e, _orig=widget.leaveEvent):
+        anim.stop(); anim.setStartValue(widget._scale); anim.setEndValue(1.0); anim.start()
+        _orig(e)
+    widget.enterEvent, widget.leaveEvent = enter, leave
+    return anim
+
+
+class PopButton(QPushButton):
+    """A plain QPushButton that pops (scales) on hover - for secondary actions that sit alone in
+    their row (Clean up, Summarize, Ask, Edit, Import…), where scaling the whole button is safe
+    because nothing else is close enough to overlap."""
+
+    def __init__(self, text: str = "", parent=None) -> None:
+        super().__init__(text, parent)
+        hover_pop(self, target=1.06)
+
+    def paintEvent(self, e) -> None:
+        g = QPainter(self)
+        g.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = QPointF(self.width() / 2, self.height() / 2)
+        g.translate(c); g.scale(self._scale, self._scale); g.translate(-c)
+        opt = QStyleOptionButton(); self.initStyleOption(opt)
+        self.style().drawControl(QStyle.ControlElement.CE_PushButton, opt, g, self)
+
+
+class TitleBarDot(QAbstractButton):
+    """A traffic-light window-control dot (close/maximize/minimize). Colour is fixed, not theme-driven -
+    close/maximize/minimize should read the same regardless of light/dark mode. Pops up (scales) on hover."""
+
+    def __init__(self, tip: str, color: str, parent=None) -> None:
+        super().__init__(parent)
+        self._color = color
+        self.setFixedSize(20, 20)                 # generous headroom around the 13px dot for the hover pop
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(tip); self.setAccessibleName(tip)
+        hover_pop(self)
+
+    def paintEvent(self, e) -> None:
+        g = QPainter(self)
+        g.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = QPointF(self.width() / 2, self.height() / 2)
+        g.translate(c); g.scale(self._scale, self._scale); g.translate(-c)
+        g.setPen(Qt.PenStyle.NoPen)
+        g.setBrush(QBrush(QColor(self._color)))
+        g.drawEllipse(QRectF(3.5, 3.5, 13.0, 13.0))
+
+
+class TitleBar(QWidget):
+    """Custom chrome for the frameless window: three traffic-light dots (close/maximize/minimize).
+    There is no native caption once the window is frameless, so this also owns drag-to-move and
+    double-click-to-maximize; window-edge resize is handled separately by MainWindow itself."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("titlebar")
+        self.setFixedHeight(38)
+        lay = QHBoxLayout(self); lay.setContentsMargins(SP["lg"], 0, SP["lg"], 0); lay.setSpacing(2)
+        self.b_close = TitleBarDot("Close", "#FF5F57")
+        self.b_max = TitleBarDot("Maximize", "#FEBC2E")
+        self.b_min = TitleBarDot("Minimize", "#28C840")
+        for b in (self.b_close, self.b_max, self.b_min):
+            lay.addWidget(b)
+        lay.addStretch()
+        self.b_close.clicked.connect(lambda: self.window().close())
+        self.b_max.clicked.connect(self._toggle_max)
+        self.b_min.clicked.connect(lambda: self.window().showMinimized())
+
+    def _toggle_max(self) -> None:
+        w = self.window()
+        w.showNormal() if w.isMaximized() else w.showMaximized()
+
+    def mouseDoubleClickEvent(self, e) -> None:
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._toggle_max()
+
+    def mousePressEvent(self, e) -> None:
+        if e.button() == Qt.MouseButton.LeftButton:
+            wh = self.window().windowHandle()
+            if wh is not None:
+                wh.startSystemMove()
+
+
 # ----------------------------------------------------------------------------- icon button
+def hover_grow_icon(widget: QWidget, repaint_icon, base_size: int, grow: int = 3, duration: int = 180) -> None:
+    """Hover micro-interaction for native icon buttons sitting in a tight toolbar row, where scaling
+    the whole button would overlap its neighbours: grows just the icon pixmap in place instead, so the
+    button's own hit box/geometry never changes and siblings are undisturbed."""
+    anim = QVariantAnimation(widget, duration=duration, easingCurve=QEasingCurve.Type.OutBack)
+    anim.valueChanged.connect(lambda v: repaint_icon(int(round(v))))
+    widget._icon_pop_anim = anim
+
+    def enter(e, _orig=widget.enterEvent):
+        anim.stop(); anim.setStartValue(base_size); anim.setEndValue(base_size + grow); anim.start(); _orig(e)
+
+    def leave(e, _orig=widget.leaveEvent):
+        anim.stop(); anim.setStartValue(base_size + grow); anim.setEndValue(base_size); anim.start(); _orig(e)
+    widget.enterEvent, widget.leaveEvent = enter, leave
+
+
 class IconButton(QToolButton):
     """32x32 (hit area 36) icon-only button; always carries a tooltip + accessible name."""
 
@@ -55,14 +168,17 @@ class IconButton(QToolButton):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         theme.init().changed.connect(self._paint_icon)
         self._paint_icon()
+        hover_grow_icon(self, self._paint_icon, self._size)
 
     def set_name(self, name: str) -> None:
         self._name = name
         self._paint_icon()
 
-    def _paint_icon(self) -> None:
+    def _paint_icon(self, size: Optional[int] = None) -> None:
         p = theme.P()
-        self.setIcon(icons.icon(self._name, p.accent if self._accent else p.text2, p.accent if self._accent else p.text, p.placeholder, self._size))
+        s = size if size is not None else self._size
+        self.setIconSize(QSize(s, s))
+        self.setIcon(icons.icon(self._name, p.accent if self._accent else p.text2, p.accent if self._accent else p.text, p.placeholder, s))
 
 
 class LabelButton(QToolButton):
@@ -80,10 +196,13 @@ class LabelButton(QToolButton):
         self.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         theme.init().changed.connect(self._paint_icon)
         self._paint_icon()
+        hover_grow_icon(self, self._paint_icon, theme.ICON["md"])
 
-    def _paint_icon(self) -> None:
+    def _paint_icon(self, size: Optional[int] = None) -> None:
         p = theme.P()
-        self.setIcon(icons.icon(self._name, p.text2, p.text, p.placeholder, theme.ICON["md"]))
+        s = size if size is not None else theme.ICON["md"]
+        self.setIconSize(QSize(s, s))
+        self.setIcon(icons.icon(self._name, p.text2, p.text, p.placeholder, s))
 
 
 class SideButton(QAbstractButton):
@@ -98,6 +217,7 @@ class SideButton(QAbstractButton):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._hover = False
         theme.init().changed.connect(self.update)
+        hover_pop(self, target=1.06)
 
     def enterEvent(self, e):
         self._hover = True; self.update()
@@ -112,6 +232,8 @@ class SideButton(QAbstractButton):
         p = theme.P()
         g = QPainter(self)
         g.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = QPointF(self.width() / 2, self.height() / 2)
+        g.translate(c); g.scale(self._scale, self._scale); g.translate(-c)
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         if self._hover or self.isDown():
             g.setBrush(QBrush(qcolor(p.fill_hover if self.isDown() else p.fill)))
@@ -180,6 +302,7 @@ class RecordButton(QAbstractButton):
         g = QPainter(self)
         g.setRenderHint(QPainter.RenderHint.Antialiasing)
         w = self.width(); c = QPointF(w / 2, w / 2)
+        g.translate(c); g.scale(1.0 + 0.06 * self._hover, 1.0 + 0.06 * self._hover); g.translate(-c)
         if self._rec:                                                          # expanding pulse ring
             for k in (0.0, 0.5):
                 t = (self._pulse + k) % 1.0
@@ -395,8 +518,12 @@ class Segmented(QWidget):
         self.setFixedHeight(34)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
         self._anim = QVariantAnimation(self, duration=MOTION["base"], easingCurve=QEasingCurve.Type.OutCubic)
         self._anim.valueChanged.connect(lambda v: (setattr(self, "_x", v), self.update()))
+        self._hover_i, self._hscale = -1, 1.0                  # only one segment can be hovered at a time
+        self._hanim = QVariantAnimation(self, duration=160, easingCurve=QEasingCurve.Type.OutBack)
+        self._hanim.valueChanged.connect(lambda v: (setattr(self, "_hscale", v), self.update()))
         theme.init().changed.connect(self.update)
         f = QFont(self.font()); f.setPixelSize(TYPE["footnote"] + 1); f.setWeight(QFont.Weight.Medium)
         fm = QFontMetrics(f)
@@ -425,6 +552,19 @@ class Segmented(QWidget):
         if 0 <= i < len(self._labels):
             self.set_current(i)
 
+    def _set_hover(self, i: int) -> None:
+        if i == self._hover_i:
+            return
+        self._hover_i = i
+        self._hanim.stop(); self._hanim.setStartValue(self._hscale); self._hanim.setEndValue(1.1 if i >= 0 else 1.0); self._hanim.start()
+
+    def mouseMoveEvent(self, e) -> None:
+        i = int((e.position().x() - 3) // self._wseg)
+        self._set_hover(i if 0 <= i < len(self._labels) else -1)
+
+    def leaveEvent(self, e) -> None:
+        self._set_hover(-1)
+
     def keyPressEvent(self, e) -> None:
         if e.key() in (Qt.Key.Key_Right, Qt.Key.Key_Down):
             self.set_current(min(self._i + 1, len(self._labels) - 1))
@@ -452,11 +592,84 @@ class Segmented(QWidget):
             if not self._enabled[k]:
                 col = p.placeholder
             g.setPen(qcolor(col))
-            g.drawText(QRectF(3 + k * self._wseg, 3, self._wseg, self.height() - 6), Qt.AlignmentFlag.AlignCenter, t)
+            rect = QRectF(3 + k * self._wseg, 3, self._wseg, self.height() - 6)
+            if k == self._hover_i and self._hscale != 1.0:
+                g.save(); c2 = rect.center(); g.translate(c2); g.scale(self._hscale, self._hscale); g.translate(-c2)
+                g.drawText(rect, Qt.AlignmentFlag.AlignCenter, t); g.restore()
+            else:
+                g.drawText(rect, Qt.AlignmentFlag.AlignCenter, t)
         if self.hasFocus():
             g.setBrush(Qt.BrushStyle.NoBrush)
             g.setPen(QPen(qcolor(p.accent), 2))
             g.drawRoundedRect(r.adjusted(1, 1, -1, -1), RADIUS["md"], RADIUS["md"])
+
+
+# ----------------------------------------------------------------------------- action bar + composer
+class ActionBar(QFrame):
+    """A slim footer strip holding a tab's one primary action - a bordered container instead of a
+    button floating with nothing around it, so Transcript/Cleaned/Summary all read as one system."""
+
+    def __init__(self, button: QWidget, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("actionbar")
+        lay = QHBoxLayout(self); lay.setContentsMargins(SP["lg"], SP["sm"], SP["lg"], SP["sm"])
+        lay.addStretch(); lay.addWidget(button)
+
+
+class SendButton(QAbstractButton):
+    """Filled circular send control for the Composer - pops on hover, dims when disabled."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(32, 32)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Send"); self.setAccessibleName("Send")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        hover_pop(self, target=1.12)
+        theme.init().changed.connect(self.update)
+
+    def paintEvent(self, e) -> None:
+        p = theme.P()
+        g = QPainter(self)
+        g.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = QPointF(self.width() / 2, self.height() / 2)
+        g.translate(c); g.scale(self._scale, self._scale); g.translate(-c)
+        on = self.isEnabled()
+        g.setPen(Qt.PenStyle.NoPen); g.setBrush(QBrush(qcolor(p.accent if on else p.fill)))
+        g.drawEllipse(c, 16, 16)
+        g.drawPixmap(8, 8, icons.pixmap("send", p.on_accent if on else p.placeholder, 16))
+
+
+class Composer(QFrame):
+    """Chat-style input bar for the Ask tab: one rounded pill holding the text field and a filled
+    send button, instead of a bare QLineEdit sitting next to a separate rectangular button."""
+
+    send = Signal(str)
+
+    def __init__(self, placeholder: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("composer")
+        self.setFixedHeight(44)
+        lay = QHBoxLayout(self); lay.setContentsMargins(SP["md"], SP["xs"], SP["xs"], SP["xs"]); lay.setSpacing(SP["xs"])
+        self.input = QLineEdit(); self.input.setProperty("flat", True); self.input.setPlaceholderText(placeholder)
+        self.input.returnPressed.connect(self._send)
+        self.btn = SendButton(); self.btn.clicked.connect(self._send)
+        lay.addWidget(self.input, 1); lay.addWidget(self.btn)
+        theme.init().changed.connect(self.update)
+
+    def _send(self) -> None:
+        t = self.input.text().strip()
+        if t:
+            self.send.emit(t)
+
+    def text(self) -> str:
+        return self.input.text()
+
+    def clear(self) -> None:
+        self.input.clear()
+
+    def setFocus(self, *a) -> None:              # noqa: A003 - matches QWidget.setFocus's name
+        self.input.setFocus(*a)
 
 
 # ----------------------------------------------------------------------------- status pill + banner + toast
@@ -682,6 +895,11 @@ ROLE_PATH, ROLE_TITLE, ROLE_SUB, ROLE_STATE, ROLE_HEADER = (Qt.ItemDataRole.User
 class MeetingDelegate(QStyledItemDelegate):
     ROW_H, HEAD_H = 58, 34
 
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.hover_path: Optional[str] = None      # which row is mid-pop, driven by MainWindow's entered/viewportEntered
+        self.hover_scale = 1.0
+
     def sizeHint(self, option, index) -> QSize:
         return QSize(option.rect.width(), self.HEAD_H if index.data(ROLE_HEADER) else self.ROW_H)
 
@@ -696,6 +914,8 @@ class MeetingDelegate(QStyledItemDelegate):
             g.drawText(r.adjusted(18, 8, -8, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, index.data(ROLE_TITLE))
             g.restore(); return
         card = r.adjusted(8, 2, -8, -2)
+        if self.hover_scale != 1.0 and index.data(ROLE_PATH) == self.hover_path:
+            c2 = card.center(); g.translate(c2); g.scale(self.hover_scale, self.hover_scale); g.translate(-c2)
         sel = bool(option.state & QStyle.StateFlag.State_Selected)
         hov = bool(option.state & QStyle.StateFlag.State_MouseOver)
         if sel or hov:

@@ -11,7 +11,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QComboBox, QDialog, QFrame, QHBoxLayout, QLineEdit, QListWidget, QMessageBox,
                                QPlainTextEdit, QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget)
 
-from .. import __version__, paths
+from .. import __version__, paths, voiceid
 from ..llm import LLMClient
 from ..settings import Settings
 from ..transcriber import MODEL_DIRS, available_models
@@ -39,6 +39,19 @@ class _Ping(QThread):
             self.ok.emit(self.client.ping())
         except Exception as e:
             self.bad.emit(str(e))
+
+
+class _RecordVoice(QThread):
+    done = Signal(bool)
+
+    def __init__(self, ctrl, seconds: float = 10.0) -> None:
+        super().__init__()
+        self.ctrl = ctrl
+        self.seconds = seconds
+
+    def run(self) -> None:
+        audio = self.ctrl.record_voice_sample(self.seconds)
+        self.done.emit(voiceid.enroll_me(audio))
 
 
 def _row(title: str, desc: str, control: QWidget, stacked: bool = False) -> QWidget:
@@ -82,9 +95,10 @@ def _page(title: str, subtitle: str = "") -> tuple:
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, s: Settings, parent=None) -> None:
+    def __init__(self, s: Settings, ctrl=None, parent=None) -> None:
         super().__init__(parent)
         self.s = s
+        self.ctrl = ctrl
         self.setObjectName("settings")
         self.setWindowTitle("Settings")
         self.resize(840, 660)
@@ -92,12 +106,12 @@ class SettingsDialog(QDialog):
         root = QVBoxLayout(self); root.setContentsMargins(0, 0, 0, 0); root.setSpacing(0)
         body = QHBoxLayout(); body.setSpacing(0); root.addLayout(body, 1)
         self.nav = QListWidget(); self.nav.setObjectName("nav"); self.nav.setFixedWidth(210); self.nav.setAccessibleName("Settings sections")
-        for n in ("Speech", "AI assistant", "Audio", "Appearance", "About"):
+        for n in ("Speech", "AI assistant", "Audio", "Voices", "Appearance", "About"):
             self.nav.addItem(n)
         self.stack = QStackedWidget()
         body.addWidget(self.nav); body.addWidget(self.stack, 1)
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
-        for builder in (self._speech, self._ai, self._audio, self._appearance, self._about):
+        for builder in (self._speech, self._ai, self._audio, self._voices, self._appearance, self._about):
             page = builder()
             sc = QScrollArea(); sc.setWidgetResizable(True); sc.setWidget(page); sc.setFrameShape(QFrame.Shape.NoFrame)
             self.stack.addWidget(sc)
@@ -185,6 +199,60 @@ class SettingsDialog(QDialog):
         v.addWidget(label("Tip: a headset gives the cleanest transcript. With laptop speakers the microphone also hears the other side; MeetAssist hides most of that echo.", "footnote", wrap=True))
         v.addStretch()
         return page
+
+    def _voices(self) -> QWidget:
+        page, v = _page("Voices", "In-person meetings hear everyone through one microphone, so MeetAssist "
+                                   "tells speakers apart by voice instead of assuming the mic is always you.")
+        card = _Card()
+        self.rec_btn = QPushButton("Record my voice (10s)")
+        self.rec_btn.clicked.connect(self._record_my_voice)
+        self.rec_lbl = label("Speak normally after clicking; this is a one-time setup.", "footnote", wrap=True)
+        card.add(_row("Me", "", self.rec_btn, stacked=False))
+        v.addWidget(card)
+        v.addWidget(self.rec_lbl)
+        self.voices_card = _Card()
+        v.addWidget(label("Other recognised voices", "callout"))
+        v.addWidget(self.voices_card)
+        v.addStretch()
+        self._refresh_voices_list()
+        return page
+
+    def _refresh_voices_list(self) -> None:
+        card = self.voices_card
+        while card._lay.count():
+            w = card._lay.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        card._n = 0
+        profiles = [p for p in voiceid.load_profiles() if p["id"] != voiceid.ME_ID]
+        if not profiles:
+            card.add(_row("None yet", "They appear here once MeetAssist hears more than one voice in a meeting.", QWidget()))
+            return
+        for p in profiles:
+            pid = p["id"]
+            edit = QLineEdit(p.get("name") or "")
+            edit.setPlaceholderText("Not named yet")
+            edit.editingFinished.connect(lambda e=edit, pid=pid: e.text().strip() and voiceid.rename_profile(pid, e.text().strip()))
+            rm = QPushButton("Remove")
+            rm.clicked.connect(lambda _=False, pid=pid: (voiceid.delete_profile(pid), self._refresh_voices_list()))
+            row = QWidget(); rl = QHBoxLayout(row)
+            rl.setContentsMargins(SP["lg"], SP["sm"], SP["lg"], SP["sm"]); rl.setSpacing(SP["md"])
+            rl.addWidget(edit, 1); rl.addWidget(rm)
+            card.add(row)
+
+    def _record_my_voice(self) -> None:
+        if not self.ctrl:
+            return
+        self.rec_btn.setEnabled(False)
+        self.rec_lbl.setText("Recording - speak normally for 10 seconds...")
+        self._rec = _RecordVoice(self.ctrl)
+        self._rec.done.connect(self._on_voice_recorded)
+        self._rec.start()
+
+    def _on_voice_recorded(self, ok: bool) -> None:
+        self.rec_btn.setEnabled(True)
+        self.rec_lbl.setText("Saved." if ok else "Could not save - check the microphone in Audio settings, "
+                                                  "or that the speaker-id model is installed.")
 
     def _appearance(self) -> QWidget:
         page, v = _page("Appearance", "MeetAssist follows Windows light and dark mode by default.")

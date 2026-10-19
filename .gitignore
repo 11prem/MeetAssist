@@ -5,6 +5,10 @@ models/
 *.m4a
 *.mp3
 audio/
+# voice recordings / recognition data belong on the user's machine only (%LOCALAPPDATA%), never here -
+# these two patterns are belt-and-suspenders in case a local dev ever points MEETASSIST_DATA_DIR at the repo
+voices.json
+speakers.json
 __pycache__/
 *.pyc
 .venv/
@@ -21,6 +25,30 @@ dist/
 
 # personal dev notes - not part of the public project
 todo.md
+
+# one-off dev-debug scripts with the author's own Windows path hardcoded in them (sys.path.insert,
+# personal recordings under audio/) - not portable, not meant for other contributors
+tools/bench_fw.py
+tools/bench_pack.py
+tools/bench_wcpp.py
+tools/cmp_en.py
+tools/demo_data.py
+tools/e2e_gui.py
+tools/e2e_import.py
+tools/e2e_live.py
+tools/e2e_refine.py
+tools/e2e_respawn.py
+tools/indic_eval.py
+tools/indic_eval2.py
+tools/lid_probe.py
+tools/logo_lab.py
+tools/make_ico.py
+tools/profile_fw.py
+tools/shot.py
+tools/shot2.py
+tools/shot3.py
+tools/shot_settings.py
+tools/trans_test.py
 
 # editor/OS cruft
 .vscode/

@@ -11,14 +11,16 @@ import sys
 from dataclasses import dataclass
 
 from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QPalette
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QPalette
+
+from .. import paths
 
 # ----------------------------------------------------------------------------- tokens: spacing / radius / type / motion
 SP = {"xxs": 2, "xs": 4, "sm": 8, "md": 12, "lg": 16, "xl": 24, "xxl": 32, "huge": 48}      # 4-pt rhythm
 RADIUS = {"sm": 6, "md": 10, "lg": 14, "xl": 20}
 ICON = {"sm": 14, "md": 18, "lg": 22, "xl": 28}                                              # one size scale for icons
 MOTION = {"fast": 120, "base": 200, "slow": 320, "pulse": 1700}                              # ms
-FONT_STACK = "'Segoe UI Variable Text','Segoe UI','Nirmala UI'"
+FONT_STACK = "'Fraunces','Segoe UI Variable Text','Segoe UI','Nirmala UI'"
 TYPE = {  # px (device independent)
     "caption": 12, "footnote": 13, "body": 14, "callout": 15, "headline": 17, "title": 26, "timer": 22, "hero": 30,
 }
@@ -72,13 +74,20 @@ LIGHT = Palette(
 )
 DARK = Palette(
     name="dark", dark=True,
-    bg="#1C1C1E", sidebar="#252528", surface="#2C2C2E", fill="#3A3A3C", fill_hover="#454548", fill_press="#505053",
-    text="#F5F5F7", text2="#C7C7CC", text3="#A8A8AE", placeholder="#6E6E73", sep="#38383A", border="#48484A",
+    bg="#0B0C10", sidebar="#101218", surface="#16181F", fill="#20232C", fill_hover="#2A2E38", fill_press="#333743",
+    text="#F5F5F7", text2="#C7C7CC", text3="#A8A8AE", placeholder="#6E6E73", sep="#1E2128", border="#363A44",
     accent="#2997FF", accent_hover="#4AA8FF", accent_press="#1A84E8", accent_tint="#16324F", accent_fill="#0A6CD6", accent_fill_hover="#1479E8", accent_fill_press="#085CB8", on_accent="#FFFFFF",
     record="#FF453A", record_hover="#FF6259", record_tint="#4A2220",
     success="#30D158", success_tint="#173323", warning="#FFB340", warning_tint="#3F2F10",
-    you="#4DA9FF", remote="#30D158", shadow="rgba(0,0,0,0.55)",
+    you="#A79CFF", remote="#5FE0D3", shadow="rgba(0,0,0,0.55)",
 )
+
+
+def rgba_str(hex_color: str, alpha: float) -> str:
+    """A literal CSS rgba() string for QSS (Qt's stylesheet engine parses this directly;
+    QColor(str) does not, so this never feeds contrast() or qcolor())."""
+    c = QColor(hex_color)
+    return f"rgba({c.red()}, {c.green()}, {c.blue()}, {alpha})"
 
 
 def contrast(fg: str, bg: str) -> float:
@@ -147,11 +156,25 @@ class ThemeManager(QObject):
 
 
 theme: ThemeManager | None = None
+_fonts_loaded = False
+
+
+def load_bundled_fonts() -> None:
+    """Load fonts shipped in assets/fonts/ so the look never depends on what happens to be installed
+    system-wide - no admin rights needed (see AGENTS.md). Safe to call more than once."""
+    global _fonts_loaded
+    if _fonts_loaded:
+        return
+    _fonts_loaded = True
+    f = paths.APP_ROOT / "assets" / "fonts" / "fraunces" / "Fraunces-Variable.ttf"
+    if f.exists():
+        QFontDatabase.addApplicationFont(str(f))
 
 
 def init() -> ThemeManager:
     global theme
     if theme is None:
+        load_bundled_fonts()
         theme = ThemeManager()
     return theme
 
@@ -161,8 +184,8 @@ def P() -> Palette:
 
 
 def app_font() -> QFont:
-    f = QFont("Segoe UI Variable Text")
-    f.setFamilies(["Segoe UI Variable Text", "Segoe UI", "Nirmala UI"])
+    f = QFont("Fraunces")
+    f.setFamilies(["Fraunces", "Segoe UI Variable Text", "Segoe UI", "Nirmala UI"])
     f.setPixelSize(TYPE["body"])
     f.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
     return f
@@ -194,7 +217,8 @@ def style_titlebar(window, p: Palette) -> None:
             return c.red() | (c.green() << 8) | (c.blue() << 16)
 
         setattr_(20, 1 if p.dark else 0)            # DWMWA_USE_IMMERSIVE_DARK_MODE
-        setattr_(35, colorref(p.sidebar))           # DWMWA_CAPTION_COLOR (Win11 22H2+)
+        setattr_(33, 2)                             # DWMWA_WINDOW_CORNER_PREFERENCE = ROUND (Win11): frameless windows default to square
+        setattr_(35, colorref(p.bg))                # DWMWA_CAPTION_COLOR (Win11 22H2+) - matches the window-edge gutter, not the floating sidebar card
         setattr_(36, colorref(p.text))              # DWMWA_TEXT_COLOR
         setattr_(34, colorref(p.sep))               # DWMWA_BORDER_COLOR
     except Exception:
@@ -204,13 +228,29 @@ def style_titlebar(window, p: Palette) -> None:
 # ----------------------------------------------------------------------------- component styles
 def build_qss(p: Palette) -> str:
     r, t = RADIUS, TYPE
+    nebula = (f"qradialgradient(cx:0.15, cy:0.08, radius:1.3, fx:0.15, fy:0.08, "
+              f"stop:0 {rgba_str(p.you, 0.20)}, stop:0.35 {rgba_str(p.you, 0.04)}, "
+              f"stop:0.65 {rgba_str(p.remote, 0.05)}, stop:1 {p.bg})")
+    mainbg = nebula if p.dark else p.bg
+    # Dark mode only: sidebar/page become floating glass cards over #mainbg's nebula, with a
+    # visible gutter (see MainWindow._build's root margins) instead of flat edge-to-edge regions.
+    glass_panels = (f"QWidget#content {{ background: {rgba_str(p.bg, 0.0)}; }}\n"
+                    f"QWidget#sidebar {{ background: {rgba_str(p.sidebar, 0.55)}; border: 1px solid {rgba_str(p.border, 0.4)}; border-radius: {r['lg']}px; }}\n"
+                    f"QWidget#page {{ background: {rgba_str(p.surface, 0.35)}; border: 1px solid {rgba_str(p.border, 0.35)}; border-radius: {r['lg']}px; }}\n"
+                    f"QFrame#vsep {{ background: transparent; }}\n"          # the gutter itself separates sidebar/content now
+                    if p.dark else "")
     return f"""
 * {{ font-family: {FONT_STACK}; font-size: {t['body']}px; color: {p.text}; outline: 0; }}
-QMainWindow, QDialog, QWidget#content, QWidget#page {{ background: {p.bg}; }}
-QWidget#sidebar {{ background: {p.sidebar}; }}
+QMainWindow, QDialog {{ background: {p.bg}; }}
+QWidget#mainbg {{ background: {mainbg}; }}
+QWidget#titlebar {{ background: transparent; }}
+QWidget#content {{ background: {p.bg}; }}
+QWidget#page {{ background: {p.bg}; border-radius: {r['lg']}px; }}
+QWidget#sidebar {{ background: {p.sidebar}; border-radius: {r['lg']}px; }}
+{glass_panels}
 QFrame#vsep {{ background: {p.sep}; border: none; max-width: 1px; min-width: 1px; }}
 QFrame#hsep {{ background: {p.sep}; border: none; max-height: 1px; min-height: 1px; }}
-QToolTip {{ background: {p.text}; color: {p.bg}; border: none; padding: 6px 9px; border-radius: {r['sm']}px; font-size: {t['footnote']}px; }}
+QToolTip {{ background: transparent; color: {p.text2}; border: none; padding: 2px; font-size: {t['footnote']}px; }}
 
 QLabel {{ background: transparent; }}
 QLabel[role="hero"]     {{ font-size: {t['hero']}px; font-weight: 700; }}
@@ -292,8 +332,11 @@ QListWidget#nav {{ background: {p.sidebar}; border-right: 1px solid {p.sep}; pad
 QListWidget#nav::item {{ padding: 9px 12px; border-radius: {r['md']}px; color: {p.text2}; margin: 1px 0; }}
 QListWidget#nav::item:selected {{ background: {p.accent_fill}; color: {p.on_accent}; }}
 QListWidget#nav::item:hover:!selected {{ background: {p.fill}; }}
-QFrame#card {{ background: {p.surface}; border: 1px solid {p.sep}; border-radius: {r['lg']}px; }}
+QFrame#card {{ background: {rgba_str(p.surface, 0.55) if p.dark else p.surface}; border: 1px solid {rgba_str(p.border, 0.5) if p.dark else p.sep}; border-radius: {r['lg']}px; }}
 QFrame#banner {{ border-radius: {r['md']}px; }}
-QFrame#dock {{ background: {p.surface}; border: 1px solid {p.sep}; border-radius: {r['xl']}px; }}
+QFrame#dock {{ background: {rgba_str(p.surface, 0.5) if p.dark else p.surface}; border: 1px solid {rgba_str(p.border, 0.55) if p.dark else p.sep}; border-radius: {r['xl']}px; }}
+QFrame#actionbar {{ border: none; border-top: 1px solid {p.sep}; background: transparent; }}
+QFrame#composer {{ background: {rgba_str(p.fill, 0.8) if p.dark else p.fill}; border: 1px solid {rgba_str(p.border, 0.4) if p.dark else "transparent"}; border-radius: 22px; }}
+QFrame#composer QLineEdit[flat="true"] {{ font-size: {t['body']}px; }}
 QScrollArea {{ background: transparent; border: none; }}
 """

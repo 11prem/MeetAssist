@@ -53,6 +53,17 @@ class _Track:
             self.f.write(b"\x00\x00" * (n - self.written))
             self.written = n
 
+    def drain(self, now: float) -> None:
+        """Write everything queued as ONE chunk so a late callback never looks like a gap before chunks still queued behind it."""
+        xs = []
+        try:
+            while True:
+                xs.append(self.q.get_nowait())
+        except queue.Empty:
+            pass
+        if xs:
+            self.write(np.concatenate(xs), now)
+
     def write(self, x: np.ndarray, now: float) -> None:
         lag = self.expected(now) - len(x) - self.written
         if lag > PAD_THRESHOLD_S * RATE:
@@ -198,14 +209,9 @@ def main() -> int:
     while True:
         now = time.time()
         for tr in tracks.values():
-            drained = 0
-            try:
-                while True:
-                    x = tr.q.get_nowait(); tr.write(x, now); drained += 1
-            except queue.Empty:
-                pass
-            # idle endpoint (loopback silent): keep the timeline moving
-            tr.pad_to(max(tr.written, tr.expected(now) - int(0.25 * RATE)))
+            tr.drain(now)
+            if tr.name == "loop":     # loopback delivers nothing while silent; a mic always delivers, so padding it only chops late audio
+                tr.pad_to(max(tr.written, tr.expected(now) - int(0.25 * RATE)))
         if stop_file.exists():
             break
         if not _alive(parent):
@@ -234,10 +240,7 @@ def main() -> int:
         except Exception: pass
     time.sleep(0.15)
     for tr in tracks.values():
-        try:
-            while True: tr.write(tr.q.get_nowait(), time.time())
-        except queue.Empty:
-            pass
+        tr.drain(time.time())
         tr.pad_to(tr.expected(time.time()))
         tr.f.close()
         try: tr.stream.close()

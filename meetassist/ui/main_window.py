@@ -7,7 +7,6 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-import numpy as np
 from PySide6.QtCore import QEasingCurve, QEvent, QThread, QTimer, Qt, QUrl, QVariantAnimation, Signal
 from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QGuiApplication, QKeySequence, QPixmap, QShortcut, QFont
 from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
@@ -17,27 +16,20 @@ from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QHBoxLayout, Q
 from .. import export, paths, store, voiceid
 from ..controller import Controller
 from ..llm import LLMClient
-from ..segmenter import RATE
 from ..settings import Settings
 from ..transcriber import available_models
 from . import theme
 from .icons import icon as svg_icon, pixmap
-from .name_speaker_dialog import NameSpeakerDialog
 from .render import ReadingView, chat_html, markdown_html, placeholder_html, summary_css, transcript_html
 from .settings_dialog import SettingsDialog, _RecordVoice
 from .theme import SP, TYPE
 from .widgets import (ROLE_HEADER, ROLE_PATH, ROLE_STATE, ROLE_SUB, ROLE_TITLE, ActionBar, Banner, Composer, EmptyState,
                       IconButton, JobIndicator, LabelButton, MeetingDelegate, MeterRow, PopButton, RecordButton,
-                      Segmented, SideButton, SourceStatusLabel, StatusPill, TitleBar, Toast, WaveStrip, label, shadow)
+                      Segmented, SideButton, SourceStatusLabel, StatusPill, TitleBar, Toast, WaveStrip, fmt_dur, label, shadow)
 
 RESIZE_MARGIN = 6
 
 DISPLAY_NAMES = {"english": "English", "roman": "Tanglish", "tamil": "Tamil"}
-
-
-def fmt_dur(sec: float) -> str:
-    s = int(sec)
-    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
 
 
 def fmt_clock(sec: float) -> str:
@@ -88,7 +80,7 @@ class MainWindow(QMainWindow):
         self.current: Optional[Path] = None
         self._row_count = -1
         self._jobs: List[Job] = []
-        self._job_text = ""
+        self._job_status: dict = {}                          # Job -> (meeting folder, indicator text); the indicator shows only the current meeting's
         self._finalized: set = set()
         self._list_sig = None
         self._search = ""
@@ -359,7 +351,7 @@ class MainWindow(QMainWindow):
                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
             self._toast("Recording your voice for 10 seconds…")
             self._enroll = _RecordVoice(self.ctrl)
-            self._enroll.done.connect(lambda ok: self._toast("Voice saved" if ok else "Could not record your voice"))
+            self._enroll.done.connect(lambda ok, msg: self._toast("Voice saved" if ok else f"Could not record your voice: {msg}"))
             self._enroll.start()
 
     def open_settings(self) -> None:
@@ -486,13 +478,13 @@ class MainWindow(QMainWindow):
     def select_meeting(self, d: Path) -> None:
         self._flush_edits()
         self.current = d; self._row_count = -1; self._list_sig = None
-        self.reload_meetings(); self._load_side_files(); self.refresh()
+        self.reload_meetings(); self._load_side_files(); self._sync_job_indicator(); self.refresh()
 
     def _on_select(self, item: Optional[QListWidgetItem], _prev=None) -> None:
         if item and item.data(ROLE_PATH):
             self._flush_edits()
             self.current = Path(item.data(ROLE_PATH)); self._row_count = -1
-            self._load_side_files(); self.refresh()
+            self._load_side_files(); self._sync_job_indicator(); self.refresh()
 
     def _on_row_entered(self, index) -> None:
         path = index.data(ROLE_PATH)
@@ -533,9 +525,10 @@ class MainWindow(QMainWindow):
         if self.ctrl.active == d:
             QMessageBox.information(self, "Recording", "Stop the recording first."); return
         if QMessageBox.question(self, "Delete meeting", "Permanently delete this meeting, its transcript AND raw audio?") == QMessageBox.StandardButton.Yes:
-            store.delete_meeting(d)
+            if not self.ctrl.delete_meeting(d):
+                QMessageBox.warning(self, "Delete meeting", f"Some files could not be deleted (still in use?):\n{d}")
             if self.current == d:
-                self.current = None
+                self.current = None; self._sync_job_indicator()
             self._list_sig = None; self.reload_meetings(); self.refresh()
 
     def _open_more(self) -> None:
@@ -583,13 +576,10 @@ class MainWindow(QMainWindow):
         while self.ctrl.refine_done:
             r = self.ctrl.refine_done.pop(0)
             self._toast("Improved transcript ready")
+            self.ctrl.identify_voices(r)               # speakers.json was dropped with the draft journal
             if r == self.current:
                 self._row_count = -1; self._load_side_files()
             self._postprocess(r)
-        while self.ctrl.voiceid_done:
-            r, unnamed = self.ctrl.voiceid_done.pop(0)
-            if unnamed:
-                self._prompt_speaker_names(r, unnamed)
             if r == self.current:
                 self._row_count = -1
         d = self.current
@@ -614,7 +604,7 @@ class MainWindow(QMainWindow):
                 detail = f"Reading audio {self.ctrl.import_progress * 100:.0f}%" + (f"  ·  {detail}" if detail else "")
         elif state == "done":
             kind, text = "done", "Transcript ready"
-            detail = f"{fmt_dur(st['audio_s'])} of audio  ·  {w.get('rtf', 0):.2f}× real-time cost"
+            detail = f"{fmt_dur(st['audio_s'])} of audio  ·  {(w.get('rtf') or 0):.2f}× real-time cost"
             if meta.get("refine_pending"):
                 rs = self.ctrl.refine_state(d) or {}
                 tot = sum(max(r["t_end"] - r["t_start"], 0) for r in rows) or 1
@@ -658,34 +648,6 @@ class MainWindow(QMainWindow):
             self.ctrl.start_refine(d, rm)
             return
         self._postprocess(d)
-
-    def _prompt_speaker_names(self, d: Path, unnamed: List[str]) -> None:
-        """A new, not-yet-recognised voice was heard in this meeting: show what they said (and let
-        the user play back a short clip of their voice) before asking what to call it, so it's
-        recognised automatically from now on - a bare timestamp isn't enough to tell who it was."""
-        rows, speakers = store.read_rows(d), store.read_speakers(d)
-        by_speaker: dict = {}
-        for r in rows:
-            pid = speakers.get(r.get("seq"))
-            if pid in unnamed:
-                by_speaker.setdefault(pid, []).append(r)
-        title = store.read_meta(d).get("title", d.name)
-        pcm_path = d / "raw" / "mic.pcm"
-        pcm = np.memmap(pcm_path, dtype=np.int16, mode="r") if pcm_path.exists() else None
-        for pid in unnamed:
-            turns = by_speaker.get(pid, [])
-            if not turns:
-                continue
-            longest = max(turns, key=lambda r: r["t_end"] - r["t_start"])
-            text = " ".join(t.get("text", "") for t in turns[:3]).strip()[:220]
-            audio = None
-            if pcm is not None:
-                a, b = int(longest["t_start"] * RATE), min(int(longest["t_end"] * RATE), len(pcm))
-                if b > a:
-                    audio = pcm[a:b].astype(np.float32) / 32768.0
-            dlg = NameSpeakerDialog(title, fmt_dur(longest["t_start"]), text, audio, self)
-            if dlg.exec() and dlg.name():
-                voiceid.rename_profile(pid, dlg.name())
 
     def _postprocess(self, d: Path) -> None:
         if self.settings.auto_postprocess and self._llm().available and not (d / "cleaned.json").exists():
@@ -788,14 +750,27 @@ class MainWindow(QMainWindow):
             self.open_settings()
         return self._llm().available
 
-    def _run_job(self, fn, ok, label_text: str, progress_text: Optional[str] = None) -> None:
+    def _sync_job_indicator(self) -> None:
+        """Show the busy indicator only while the meeting on screen has a job running."""
+        texts = [t for m, t in self._job_status.values() if m == self.current]
+        if not texts:
+            self.job_indicator.stop()
+        elif self.job_indicator.isHidden():
+            self.job_indicator.start(texts[-1])
+        else:
+            self.job_indicator.set_text(texts[-1])
+
+    def _run_job(self, fn, ok, label_text: str, d: Optional[Path], progress_text: Optional[str] = None) -> None:
         j = Job(fn, self); self._jobs.append(j)
         prog = progress_text or label_text
-        self._job_text = label_text; self.job_indicator.start(f"{prog}…"); self.refresh()
+        self._job_status[j] = (d, f"{prog}…"); self._sync_job_indicator(); self.refresh()
 
         def end():
-            self._job_text = ""; self.job_indicator.stop(); self.refresh()
-        j.progress.connect(lambda a, b: (setattr(self, "_job_text", f"{label_text} {a}/{b}"), self.job_indicator.set_text(f"{prog}… {a}/{b}")))
+            self._job_status.pop(j, None); self._sync_job_indicator(); self.refresh()
+        def on_progress(a, b):
+            if j in self._job_status:
+                self._job_status[j] = (d, f"{prog}… {a}/{b}"); self._sync_job_indicator()
+        j.progress.connect(on_progress)
         j.done.connect(lambda r: (end(), self._toast(f"{label_text} complete"), ok(r)))
         j.failed.connect(lambda e: (end(), QMessageBox.warning(self, label_text, f"Could not complete:\n{e}")))
         j.finished.connect(lambda: self._jobs.remove(j) if j in self._jobs else None)
@@ -819,7 +794,7 @@ class MainWindow(QMainWindow):
             if not text_path.exists():            # seed the editable copy once; never clobber a manual edit
                 text_path.write_text(export.render_txt(rows, "cleaned", {int(k): v for k, v in cleaned.items()}, roman=mode), encoding="utf-8")
             return True
-        self._run_job(work, lambda _: (self._load_side_files(), self.seg.set_current(1)) if d == self.current else None, "Cleaning up")
+        self._run_job(work, lambda _: (self._load_side_files(), self.seg.set_current(1)) if d == self.current else None, "Cleaning up", d)
 
     def run_summary(self, d: Optional[Path] = None) -> None:
         d = d if isinstance(d, Path) else self.current
@@ -832,7 +807,7 @@ class MainWindow(QMainWindow):
         def work(progress):
             md = client.summarize(text, progress)
             (d / "summary.md").write_text(md, encoding="utf-8"); return md
-        self._run_job(work, lambda _: (self._load_side_files(), self.seg.set_current(2)) if d == self.current else None, "Summarising")
+        self._run_job(work, lambda _: (self._load_side_files(), self.seg.set_current(2)) if d == self.current else None, "Summarising", d)
 
     def _ask_context(self, d: Path) -> str:
         text = self._cleaned_text(d) or export.render_txt(store.read_rows(d), roman=self.settings.tamil_display)
@@ -860,7 +835,7 @@ class MainWindow(QMainWindow):
             (d / "chat.json").write_text(json.dumps(full, ensure_ascii=False), encoding="utf-8")
             if d == self.current:                             # user may have switched meetings while this was in flight
                 self._chat_history = full; self._render_chat()
-        self._run_job(work, ok, "Asking", progress_text="Thinking")
+        self._run_job(work, ok, "Asking", d, progress_text="Thinking")
 
     def retranscribe(self, model: str) -> None:
         d = self.current

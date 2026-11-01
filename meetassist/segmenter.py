@@ -43,7 +43,7 @@ def _get_vad():
 
 class TrackSegmenter:
     def __init__(self, track: str, *, threshold: float = 0.5, min_silence_s: float = 0.7,
-                 min_speech_s: float = 0.30, pad_s: float = 0.20, max_s: float = 28.0) -> None:
+                 min_speech_s: float = 0.30, pad_s: float = 0.20, max_s: float = 28.0, start_frame: int = 0) -> None:
         self.track = track
         self.th, self.neg = threshold, max(threshold - 0.15, 0.1)
         self.min_sil = int(min_silence_s / FRAME_S)
@@ -52,15 +52,15 @@ class TrackSegmenter:
         self.max_frames = int(max_s / FRAME_S)
         self.vad = _get_vad()
         self.buf = np.zeros(0, dtype=np.float32)   # audio starting at absolute frame `fbase`
-        self.fbase = 0                             # absolute frame index of buf[0]
+        self.fbase = start_frame                   # absolute frame index of buf[0] (a resumed worker starts mid-file)
         self.probs: List[float] = []               # probs[k] belongs to absolute frame fbase + k
-        self.i = 0                                 # next absolute frame to examine
+        self.i = start_frame                       # next absolute frame to examine
         self.h = np.zeros((1, 1, 128), np.float32)   # silero recurrent state
         self.c = np.zeros((1, 1, 128), np.float32)
         self.ctx = np.zeros(CTX, np.float32)
         self.in_speech = False
-        self.sp_start = 0                          # absolute frame where current speech began
-        self.last_speech = 0                       # absolute frame of last speech-ish frame
+        self.sp_start = start_frame                # absolute frame where current speech began
+        self.last_speech = start_frame             # absolute frame of last speech-ish frame
 
     # ------------------------------------------------------------------ scoring
     def _score_new(self) -> None:

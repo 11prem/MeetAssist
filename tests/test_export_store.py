@@ -112,3 +112,54 @@ def test_display_modes_english_roman_tamil():
     assert "This is for a trip Sounds good." in eng and "இ" not in eng and "namma" in eng
     assert "இது ஒரு" in export.render_txt(rows, roman="tamil")
     assert "idhu oru" in export.render_txt(rows, roman="roman").lower() or "idhu" in export.render_txt(rows, roman="roman")
+
+
+def test_resume_offsets_are_max_committed_end_per_track(tmp_path):
+    from meetassist.asr_worker import resume_offsets
+    p = tmp_path / "journal.jsonl"
+    assert resume_offsets(p) == {"mic": 0.0, "loop": 0.0}                  # fresh run
+    p.write_text("\n".join(json.dumps(r) for r in ROWS[:4]) + "\n"
+                 + json.dumps({"seq": 6, "track": "mic", "t_start": 9.6, "t_end": 11.0, "text": "x", "echo": True})
+                 + '\n{"seq": 7, "track": "loop", "t_end": 99', encoding="utf-8")   # echo rows count, torn line ignored
+    assert resume_offsets(p) == {"mic": 11.0, "loop": 6.0}
+
+
+@pytest.mark.skipif(not (paths.MODELS_DIR / "ct2-small" / "model.bin").exists(), reason="small model not installed")
+def test_respawned_worker_resumes_after_last_committed_row(tmp_path, monkeypatch):
+    sample = paths.APP_ROOT / "audio" / "Recording.m4a"
+    if not sample.exists():
+        pytest.skip("sample missing")
+    monkeypatch.setattr(paths, "MEETINGS_DIR", tmp_path / "m")
+    d = store.new_meeting("w", "import", "small")
+    store.decode_to_pcm(str(sample), d / "raw" / "mic.pcm")
+    pcm = d / "raw" / "mic.pcm"; pcm.write_bytes(pcm.read_bytes()[: 16000 * 2 * 25])
+    (d / "raw" / "END").write_text("x")
+    (d / "journal.jsonl").write_text(json.dumps({"seq": 1, "track": "mic", "t_start": 0.5, "t_end": 12.0, "text": "earlier"}) + "\n", encoding="utf-8")
+    r = subprocess.run([sys.executable, "-m", "meetassist.asr_worker", "--meeting-dir", str(d), "--model", "small",
+                        "--language", "whisper"], cwd=str(paths.APP_ROOT), timeout=400, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-500:]
+    rows = export.read_journal(d / "journal.jsonl")
+    assert rows[0]["text"] == "earlier" and len(rows) > 1
+    assert all(x["t_start"] >= 12.0 - 0.01 and x["seq"] > 1 for x in rows[1:]), "a resumed worker must not redo committed audio"
+
+
+def test_journal_append_after_torn_last_line_starts_a_new_line(tmp_path):
+    from meetassist.asr_worker import Journal
+    from meetassist.transcriber import Piece
+    p = tmp_path / "journal.jsonl"
+    p.write_text(json.dumps(ROWS[0]) + "\n" + '{"seq": 2, "track": "mi', encoding="utf-8")
+    j = Journal(p); j.add(Piece("mic", 5.0, 6.0, "after the crash", "en"), "small"); j.f.close()
+    assert [r["text"] for r in export.read_journal(p)] == ["Hello team.", "after the crash"]
+    assert '{"seq": 2, "track": "mi\n' in p.read_text(encoding="utf-8")       # the torn text itself is left as it was
+
+
+def test_delete_with_an_open_memmap_keeps_the_meeting_listed_and_retryable(tmp_path, monkeypatch):
+    """An open handle on raw audio (voice ID's memmap) must not leave a hidden folder still holding the pcm."""
+    monkeypatch.setattr(paths, "MEETINGS_DIR", tmp_path / "m")
+    d = store.new_meeting("busy")
+    (d / "raw" / "mic.pcm").write_bytes(np.ones(1000, np.int16).tobytes()); (d / "journal.jsonl").write_text("{}\n")
+    held = [np.memmap(d / "raw" / "mic.pcm", dtype=np.int16, mode="r")]
+    assert store.delete_meeting(d) is False
+    assert [m.path for m in store.list_meetings()] == [d]
+    held.clear()                                              # memmap closed
+    assert store.delete_meeting(d) is True and not d.exists()

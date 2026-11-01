@@ -1,6 +1,7 @@
 """Meeting folders on disk: %LOCALAPPDATA%\\MeetAssist\\meetings\\<id>\\{meta.json, raw/, journal.jsonl, exports/}."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -73,10 +74,29 @@ def list_meetings() -> List[MeetingInfo]:
     return out
 
 
-def delete_meeting(d: Path) -> None:
-    # AGENTS rule 2: raw audio is only ever removed on an explicit user action (this function).
-    if d.resolve().parent == paths.MEETINGS_DIR.resolve():
-        shutil.rmtree(d, ignore_errors=True)
+def delete_meeting(d: Path, attempts: int = 5) -> bool:
+    """AGENTS rule 2: raw audio is only ever removed on an explicit user action (this function). meta.json goes
+    last, only once everything else is gone: a file still locked (voice ID's memmap, a killed worker's handle)
+    keeps the meeting listed, so the user can retry. Returns whether the folder is gone."""
+    if d.resolve().parent != paths.MEETINGS_DIR.resolve():
+        return False
+    for n in range(attempts):
+        if not d.exists():
+            return True
+        if n:
+            time.sleep(0.2)                  # Windows releases a just-killed process's handles a moment after exit
+        for p in d.iterdir():
+            if p.name == "meta.json":
+                continue
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                with contextlib.suppress(OSError):
+                    p.unlink()
+        if not any(p.name != "meta.json" for p in d.iterdir()):
+            with contextlib.suppress(OSError):
+                (d / "meta.json").unlink(missing_ok=True); d.rmdir()
+    return not d.exists()
 
 
 def read_speakers(d: Path) -> Dict[int, str]:

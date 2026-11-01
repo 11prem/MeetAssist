@@ -31,7 +31,7 @@ from typing import Dict, List
 import numpy as np
 
 from . import echo, lid, paths, tamil
-from .segmenter import RATE, TrackSegmenter, Utterance
+from .segmenter import FRAME, RATE, TrackSegmenter, Utterance
 from .transcriber import MODEL_DIRS, Piece, Transcriber
 
 TRACKS = ("mic", "loop")
@@ -67,13 +67,15 @@ class Journal:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.seq = 0
-        if path.exists():
-            for ln in path.read_text(encoding="utf-8", errors="replace").splitlines():
-                try:
-                    self.seq = max(self.seq, json.loads(ln).get("seq", 0))
-                except Exception:
-                    pass
+        text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+        for ln in text.splitlines():
+            try:
+                self.seq = max(self.seq, json.loads(ln).get("seq", 0))
+            except Exception:
+                pass
         self.f = open(path, "a", encoding="utf-8")
+        if text and not text.endswith("\n"):
+            self.f.write("\n")                                  # torn last line (hard kill): don't glue the next row onto it
 
     def add(self, p: Piece, model: str) -> None:
         self.seq += 1
@@ -87,6 +89,20 @@ class Journal:
             row["alt"] = p.alt                                  # the other engine's reading (hint for LLM clean-up)
         self.f.write(json.dumps(row, ensure_ascii=False) + "\n")
         self.f.flush(); os.fsync(self.f.fileno())
+
+
+def resume_offsets(path: Path) -> Dict[str, float]:
+    """Per track, the latest committed t_end in an existing journal: a respawned worker continues there
+    instead of re-transcribing (and duplicating) everything from 0."""
+    out = {t: 0.0 for t in TRACKS}
+    if path.exists():
+        for ln in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                r = json.loads(ln)
+                out[r["track"]] = max(out.get(r["track"], 0.0), float(r["t_end"]))
+            except Exception:
+                pass                                            # torn last line
+    return out
 
 
 def _set_low_priority() -> None:
@@ -127,10 +143,14 @@ def run(meeting: Path, model_key: str, language: str, vocabulary: str, threads: 
         return 2
     model_label = "indic+" + tr.name if (tr and indic) else ("indic-conformer" if indic else tr.name)
 
+    start = {t: int(o * RATE) // FRAME for t, o in resume_offsets(meeting / journal_name).items()}
     journal = Journal(meeting / journal_name)
     tails = {t: PcmTail(raw / f"{t}.pcm") for t in TRACKS}
+    for t in TRACKS:
+        tails[t].pos = start[t] * FRAME * 2
     short = mode in ("hybrid", "ta")                  # Indic is trained on short clips: cap utterances at ~8.5 s
-    segs = {t: TrackSegmenter(t, max_s=8.5, min_silence_s=0.5) if short else TrackSegmenter(t) for t in TRACKS}
+    segs = {t: TrackSegmenter(t, max_s=8.5, min_silence_s=0.5, start_frame=start[t]) if short
+            else TrackSegmenter(t, start_frame=start[t]) for t in TRACKS}
     pending: Dict[str, List[Utterance]] = {t: [] for t in TRACKS}
     first_seen: Dict[str, float] = {}
     context: Dict[str, str] = {t: "" for t in TRACKS}

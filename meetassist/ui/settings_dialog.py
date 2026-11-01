@@ -16,8 +16,9 @@ from ..llm import LLMClient
 from ..settings import Settings
 from ..transcriber import MODEL_DIRS, available_models
 from . import theme
+from .name_speaker_dialog import NameSpeakerDialog
 from .theme import SP
-from .widgets import Segmented, Switch, label
+from .widgets import Segmented, Switch, fmt_dur, label
 
 MODEL_HELP = {"large-v3-turbo": "most accurate, slowest", "medium": "balanced", "small": "fastest, great for live meetings"}
 LANGS = [("hybrid", "Tamil + English + Tanglish (recommended)"),
@@ -42,7 +43,7 @@ class _Ping(QThread):
 
 
 class _RecordVoice(QThread):
-    done = Signal(bool)
+    done = Signal(bool, str)          # (ok, reason when not ok)
 
     def __init__(self, ctrl, seconds: float = 10.0) -> None:
         super().__init__()
@@ -50,8 +51,17 @@ class _RecordVoice(QThread):
         self.seconds = seconds
 
     def run(self) -> None:
-        audio = self.ctrl.record_voice_sample(self.seconds)
-        self.done.emit(voiceid.enroll_me(audio))
+        try:
+            audio = self.ctrl.record_voice_sample(self.seconds)
+            ok = voiceid.enroll_me(audio)
+        except Exception as e:
+            self.done.emit(False, str(e) or type(e).__name__); return
+        if ok:
+            self.done.emit(True, "")
+        elif not paths.SPEAKER_MODEL.exists():
+            self.done.emit(False, "the speaker-id model is not installed")
+        else:
+            self.done.emit(False, "not enough clear speech was heard - speak normally, closer to the microphone")
 
 
 def _row(title: str, desc: str, control: QWidget, stacked: bool = False) -> QWidget:
@@ -212,6 +222,7 @@ class SettingsDialog(QDialog):
         v.addWidget(self.rec_lbl)
         self.voices_card = _Card()
         v.addWidget(label("Other recognised voices", "callout"))
+        v.addWidget(label("Click a voice to listen to it and give it a name.", "footnote", wrap=True))
         v.addWidget(self.voices_card)
         v.addStretch()
         self._refresh_voices_list()
@@ -224,21 +235,34 @@ class SettingsDialog(QDialog):
             if w:
                 w.deleteLater()
         card._n = 0
+        voiceid.merge_duplicate_names()      # heals same-name duplicates saved before rename merged them all
         profiles = [p for p in voiceid.load_profiles() if p["id"] != voiceid.ME_ID]
         if not profiles:
             card.add(_row("None yet", "They appear here once MeetAssist hears more than one voice in a meeting.", QWidget()))
             return
+        samples = voiceid.find_samples()
         for p in profiles:
-            pid = p["id"]
-            edit = QLineEdit(p.get("name") or "")
-            edit.setPlaceholderText("Not named yet")
-            edit.editingFinished.connect(lambda e=edit, pid=pid: e.text().strip() and voiceid.rename_profile(pid, e.text().strip()))
+            pid, name, s = p["id"], p.get("name") or "", samples.get(p["id"])
+            t = s["title"] if s else ""
+            title = t if len(t) <= 40 else t[:39] + "…"
+            where =f"Heard in “{title}”  ·  {fmt_dur(s['t_start'])}" if s else "Not in any saved meeting"
+            open_btn = QPushButton(f"{name or 'Unnamed voice'}\n{where}")
+            open_btn.setProperty("variant", "side"); open_btn.setToolTip("Listen to this voice and name it")
+            open_btn.clicked.connect(lambda _=False, pid=pid, s=s, name=name: self._name_voice(pid, s, name))
             rm = QPushButton("Remove")
             rm.clicked.connect(lambda _=False, pid=pid: (voiceid.delete_profile(pid), self._refresh_voices_list()))
             row = QWidget(); rl = QHBoxLayout(row)
             rl.setContentsMargins(SP["lg"], SP["sm"], SP["lg"], SP["sm"]); rl.setSpacing(SP["md"])
-            rl.addWidget(edit, 1); rl.addWidget(rm)
+            rl.addWidget(open_btn, 1); rl.addWidget(rm)
             card.add(row)
+
+    def _name_voice(self, pid: str, sample, name: str) -> None:
+        """Open the naming dialog for one voice: what they said, a clip to listen to, and where they were heard."""
+        dlg = NameSpeakerDialog(sample["title"] if sample else None, fmt_dur(sample["t_start"]) if sample else "",
+                                sample["text"] if sample else "", voiceid.sample_audio(sample) if sample else None, self, name)
+        if dlg.exec() and dlg.name():
+            voiceid.rename_profile(pid, dlg.name())
+            self._refresh_voices_list()
 
     def _record_my_voice(self) -> None:
         if not self.ctrl:
@@ -249,10 +273,9 @@ class SettingsDialog(QDialog):
         self._rec.done.connect(self._on_voice_recorded)
         self._rec.start()
 
-    def _on_voice_recorded(self, ok: bool) -> None:
+    def _on_voice_recorded(self, ok: bool, msg: str = "") -> None:
         self.rec_btn.setEnabled(True)
-        self.rec_lbl.setText("Saved." if ok else "Could not save - check the microphone in Audio settings, "
-                                                  "or that the speaker-id model is installed.")
+        self.rec_lbl.setText("Saved." if ok else f"Could not save: {msg}")
 
     def _appearance(self) -> QWidget:
         page, v = _page("Appearance", "MeetAssist follows Windows light and dark mode by default.")

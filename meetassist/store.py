@@ -8,7 +8,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import numpy as np
 
@@ -76,7 +76,7 @@ def list_meetings() -> List[MeetingInfo]:
 
 def delete_meeting(d: Path, attempts: int = 5) -> bool:
     """AGENTS rule 2: raw audio is only ever removed on an explicit user action (this function). meta.json goes
-    last, only once everything else is gone: a file still locked (voice ID's memmap, a killed worker's handle)
+    last, only once everything else is gone: a file still locked (a killed worker's handle)
     keeps the meeting listed, so the user can retry. Returns whether the folder is gone."""
     if d.resolve().parent != paths.MEETINGS_DIR.resolve():
         return False
@@ -99,27 +99,10 @@ def delete_meeting(d: Path, attempts: int = 5) -> bool:
     return not d.exists()
 
 
-def read_speakers(d: Path) -> Dict[int, str]:
-    """<meeting>/speakers.json: seq -> recognised voice-profile id (written by voiceid.identify_speakers)."""
-    data = read_json(d / "speakers.json") or {}
-    return {int(k): v for k, v in data.items()}
-
-
-def write_speakers(d: Path, mapping: Dict[int, str]) -> None:
-    tmp = d / "speakers.tmp"
-    tmp.write_text(json.dumps({str(k): v for k, v in mapping.items()}, indent=2), encoding="utf-8")
-    os.replace(tmp, d / "speakers.json")
-
-
 def read_rows(d: Path, hide_echo: bool = True) -> List[dict]:
-    """Journal rows with recognised speaker names attached, for display - the usual way to read
-    a meeting's transcript (see export.read_journal for the raw, speaker-less parse)."""
-    from . import export, voiceid
-    rows = export.read_journal(d / "journal.jsonl", hide_echo)
-    speakers = read_speakers(d)
-    if speakers:
-        export.attach_speakers(rows, speakers, voiceid.profile_names())
-    return rows
+    """A meeting's journal rows, for display - the usual way to read a meeting's transcript."""
+    from . import export
+    return export.read_journal(d / "journal.jsonl", hide_echo)
 
 
 def audio_seconds(d: Path) -> float:

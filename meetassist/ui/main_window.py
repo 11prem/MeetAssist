@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QHBoxLayout, Q
                                QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
                                QStackedWidget, QVBoxLayout, QWidget)
 
-from .. import export, paths, store, voiceid
+from .. import export, paths, store
 from ..controller import Controller
 from ..llm import LLMClient
 from ..settings import Settings
@@ -21,7 +21,7 @@ from ..transcriber import available_models
 from . import theme
 from .icons import icon as svg_icon, pixmap
 from .render import ReadingView, chat_html, markdown_html, placeholder_html, summary_css, transcript_html
-from .settings_dialog import SettingsDialog, _RecordVoice
+from .settings_dialog import SettingsDialog
 from .theme import SP, TYPE
 from .widgets import (ROLE_HEADER, ROLE_PATH, ROLE_STATE, ROLE_SUB, ROLE_TITLE, ActionBar, Banner, Composer, EmptyState,
                       IconButton, JobIndicator, LabelButton, MeetingDelegate, MeterRow, PopButton, RecordButton,
@@ -334,28 +334,9 @@ class MainWindow(QMainWindow):
         if not self._models_ok():
             QMessageBox.critical(self, "Speech model missing",
                                  f"No speech-recognition model was found in:\n{paths.MODELS_DIR}\n\nCopy the 'models' folder next to the application.")
-            return
-        self._maybe_offer_voice_enrollment()
-
-    def _maybe_offer_voice_enrollment(self) -> None:
-        """One-time, on first run: offer to learn the user's voice so MeetAssist never has to ask
-        who they are, even in an in-person meeting where everyone shares one microphone."""
-        if self.settings.voice_enroll_asked or any(p["id"] == voiceid.ME_ID for p in voiceid.load_profiles()):
-            return
-        self.settings.voice_enroll_asked = True
-        self.settings.save()
-        if QMessageBox.question(self, "Recognise your voice",
-                                "MeetAssist can learn your voice once so it never has to ask who you are later - "
-                                "even in an in-person meeting where everyone is heard through the same microphone.\n\n"
-                                "Record a 10-second sample now? You can also do this later in Settings → Voices.",
-                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
-            self._toast("Recording your voice for 10 seconds…")
-            self._enroll = _RecordVoice(self.ctrl)
-            self._enroll.done.connect(lambda ok, msg: self._toast("Voice saved" if ok else f"Could not record your voice: {msg}"))
-            self._enroll.start()
 
     def open_settings(self) -> None:
-        dlg = SettingsDialog(self.settings, self.ctrl, self)
+        dlg = SettingsDialog(self.settings, self)
         if dlg.exec():
             self.settings.save(); self.ctrl.settings = self.settings
             self.tm.set_mode(self.settings.appearance)
@@ -576,7 +557,6 @@ class MainWindow(QMainWindow):
         while self.ctrl.refine_done:
             r = self.ctrl.refine_done.pop(0)
             self._toast("Improved transcript ready")
-            self.ctrl.identify_voices(r)               # speakers.json was dropped with the draft journal
             if r == self.current:
                 self._row_count = -1; self._load_side_files()
             self._postprocess(r)
@@ -641,7 +621,6 @@ class MainWindow(QMainWindow):
 
     def _on_done(self, d: Path) -> None:
         meta = store.read_meta(d)
-        self.ctrl.identify_voices(d)
         rm = self.settings.refine_model
         if (rm and rm != meta.get("model") and rm in available_models(paths.MODELS_DIR)
                 and not meta.get("refined") and not meta.get("refine_pending") and d not in self.ctrl.refiners):

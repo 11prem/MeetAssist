@@ -1,0 +1,10 @@
+On the other laptop: copy everything in this folder over the MeetAssist folder, then DELETE these
+(voice recognition was removed from the app):
+
+meetassist\voiceid.py
+meetassist\ui\name_speaker_dialog.py
+tests\test_voiceid.py
+models\speaker-id\        (whole folder - no longer used)
+
+Optional, to free a little space in the bundled runtime:
+runtime\python\python.exe -m pip uninstall -y kaldi-native-fbank

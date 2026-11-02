@@ -8,17 +8,13 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
-import traceback
 from pathlib import Path
 from typing import Callable, List, Optional
-
-import numpy as np
 
 from . import capture_proc, paths, store
 from .settings import Settings
@@ -79,7 +75,6 @@ class Controller:
         self.capture_failed = False
         self.refine_done: list = []                  # meetings whose refinement just finished (GUI drains this)
         self.refiners: dict = {}                     # meeting dir -> background 'refine' worker process
-        self._voiceid_running: set = set()
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ live recording
@@ -145,8 +140,7 @@ class Controller:
             if j.exists():
                 j.replace(d / "journal.draft.jsonl")       # AGENTS rule 4: the earlier text is never destroyed
             r.replace(j)
-            for f in ("cleaned.json", "speakers.json"):    # both keyed to the draft's seq numbers
-                (d / f).unlink(missing_ok=True)
+            (d / "cleaned.json").unlink(missing_ok=True)    # keyed to the draft's seq numbers
             (d / "summary.md").rename(d / "summary.draft.md") if (d / "summary.md").exists() else None
             store.update_meta(d, model=meta.get("refine_model", meta.get("model")), refine_pending=False, refined=True)
             w = store.read_json(d / "worker.refine.json") or {}
@@ -199,65 +193,6 @@ class Controller:
         self.active, self.capture = None, None
         return d
 
-    # ------------------------------------------------------------------ speaker voice recognition
-    def identify_voices(self, d: Path) -> None:
-        """Background pass (runs once per meeting, after transcription is done): embeds mic- and loopback-track
-        speech and matches/clusters it against saved voice profiles. Never blocks the GUI."""
-        if d in self._voiceid_running or (d / "speakers.json").exists():   # already done: re-running re-adds the same audio to centroids
-            return
-        self._voiceid_running.add(d)
-
-        def run() -> None:
-            from . import voiceid
-            try:
-                if voiceid.identify_speakers(d) is None:     # journal was swapped (refine) mid-run: redo for the new one
-                    voiceid.identify_speakers(d)
-            except Exception:
-                traceback.print_exc()                    # stderr is app.log in the windowed app
-            self._row_cache.pop(d, None)                 # force a re-read so names show up immediately
-            self._voiceid_running.discard(d)
-        threading.Thread(target=run, daemon=True).start()
-
-    def record_voice_sample(self, seconds: float, ready_timeout: float = 20.0, stop_timeout: float = 5.0) -> np.ndarray:
-        """Blocking: captures `seconds` of mic audio to a scratch folder (self-voice enrollment)
-        and returns it as float32 mono 16 kHz. Call this off the GUI thread. Reuses the same
-        capture subprocess as live recording rather than opening the microphone a second way.
-        The `seconds` clock starts only once capture reports `recording` (interpreter + PortAudio startup
-        can take seconds); raises RuntimeError with capture's own message if it fails to start."""
-        tmp = paths.DATA_DIR / "_voice_sample"
-        shutil.rmtree(tmp, ignore_errors=True)
-        tmp.mkdir(parents=True, exist_ok=True)
-        args = ["--raw-dir", str(tmp), "--epoch", repr(time.time()), "--no-loop"]
-        if self.settings.mic_name:
-            args += ["--mic-name", self.settings.mic_name]
-        p = _spawn("meetassist.capture_proc", args, tmp / "capture.log")
-        try:
-            t0 = time.time()
-            while True:
-                st = store.read_json(tmp / "status.json") or {}
-                if st.get("state") == "error" or p.poll() is not None:
-                    raise RuntimeError(st.get("error") or f"microphone capture exited unexpectedly (code {p.poll()})")
-                if st.get("state") == "recording":
-                    break
-                if time.time() - t0 > ready_timeout:
-                    raise RuntimeError(f"microphone did not start within {ready_timeout:g} s")
-                time.sleep(0.05)
-            time.sleep(seconds)
-            (tmp / "STOP").write_text("stop")
-            try:
-                p.wait(timeout=stop_timeout)
-            except subprocess.TimeoutExpired:
-                p.kill(); p.wait()                       # must be dead before its files are read/deleted (Windows keeps them locked)
-            pcm = tmp / "mic.pcm"
-            audio = (np.frombuffer(pcm.read_bytes(), dtype=np.int16).astype(np.float32) / 32768.0
-                     if pcm.exists() else np.zeros(0, np.float32))
-        finally:
-            if p.poll() is None:
-                p.kill(); p.wait()
-            shutil.rmtree(tmp, ignore_errors=True)
-        nz = np.flatnonzero(audio)                       # capture zero-pads from --epoch: drop startup/shutdown padding
-        return audio[nz[0]:nz[-1] + 1] if nz.size else audio[:0]
-
     def recover(self) -> List[Path]:
         """Meetings left open by a crash/power loss: finalise them so their worker can finish."""
         out = []
@@ -300,9 +235,6 @@ class Controller:
                 t0 = time.time()
                 while capture_proc._alive(int(pid)) and time.time() - t0 < 5:
                     time.sleep(0.05)
-        t0 = time.time()
-        while d in self._voiceid_running and time.time() - t0 < 5:     # its memmap keeps raw/*.pcm undeletable
-            time.sleep(0.05)
         return store.delete_meeting(d)
 
     # ------------------------------------------------------------------ import / re-run
@@ -334,7 +266,7 @@ class Controller:
         j = d / "journal.jsonl"
         if j.exists():
             j.rename(d / f"journal.prev-{ts}.jsonl")
-        for f in ("worker.json", "cleaned.json", "speakers.json"):    # new journal restarts seq at 1
+        for f in ("worker.json", "cleaned.json"):    # new journal restarts seq at 1
             (d / f).unlink(missing_ok=True)
         store.update_meta(d, model=model or self.settings.model_name)
         (d / "raw" / "END").write_text("end")

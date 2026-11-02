@@ -1,0 +1,56 @@
+import numpy as np, av, pytest
+from meetassist import paths
+from meetassist.segmenter import TrackSegmenter, RATE, FRAME
+
+def load(path):
+    c = av.open(path); r = av.AudioResampler(format="s16", layout="mono", rate=RATE); out=[]
+    for f in c.decode(audio=0):
+        for x in r.resample(f): out.append(x.to_ndarray().reshape(-1))
+    return np.concatenate(out).astype(np.float32)/32768
+
+SAMPLE = paths.APP_ROOT / "audio" / "Recording.m4a"       # dev-only fixture, not committed - tests skip without it
+
+def run(audio, block):
+    seg = TrackSegmenter("mic"); us = []
+    for k in range(0, len(audio), block): us += seg.feed(audio[k:k+block])
+    us += seg.flush(); return us
+
+def test_silence_gives_nothing():
+    assert run(np.zeros(RATE*10, np.float32), 1600) == []
+
+@pytest.mark.skipif(not SAMPLE.exists(), reason="dev-only audio fixture not present")
+def test_real_speech_is_cut_at_pauses_and_bounded():
+    a = load(SAMPLE)
+    us = run(a, 1600)
+    assert len(us) >= 5
+    assert all(u.dur <= 29.0 for u in us)
+    assert all(b.start_s >= a_.end_s - 0.6 for a_, b in zip(us, us[1:]))      # ordered, ~non-overlapping
+    assert all(0 <= u.start_s < u.end_s <= len(a)/RATE + 0.1 for u in us)
+
+@pytest.mark.skipif(not SAMPLE.exists(), reason="dev-only audio fixture not present")
+def test_block_size_independent():
+    a = load(SAMPLE)[:RATE*60]
+    x, y = run(a, 1600), run(a, 8000)
+    assert abs(len(x) - len(y)) <= 1
+
+@pytest.mark.skipif(not SAMPLE.exists(), reason="dev-only audio fixture not present")
+def test_forced_cuts_do_not_overlap():
+    a = load(SAMPLE)
+    seg = TrackSegmenter("mic", max_s=6.0, min_silence_s=0.5); us = []
+    for k in range(0, len(a), 1600): us += seg.feed(a[k:k+1600])
+    us += seg.flush()
+    assert max(u.dur for u in us) <= 6.5
+    assert all(b.start_s >= x.end_s - 1e-6 for x, b in zip(us, us[1:])), "adjacent utterances must not overlap (duplicate words)"
+
+@pytest.mark.skipif(not SAMPLE.exists(), reason="dev-only audio fixture not present")
+def test_resume_from_mid_file_frame_keeps_meeting_timeline():
+    a = load(SAMPLE)[:RATE*60]
+    full = run(a, 1600)
+    cut = full[len(full) // 2].end_s                   # where a dead worker's last committed row ended
+    frame = int(cut * RATE) // FRAME
+    seg = TrackSegmenter("mic", start_frame=frame); b = a[frame * FRAME:]; us = []
+    for k in range(0, len(b), 1600): us += seg.feed(b[k:k+1600])
+    us += seg.flush()
+    want = [u for u in full if u.start_s >= cut]
+    assert want and len(us) == len(want)
+    assert all(abs(x.start_s - y.start_s) < 0.1 and abs(x.end_s - y.end_s) < 0.1 for x, y in zip(us, want))

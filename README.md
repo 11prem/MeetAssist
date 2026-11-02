@@ -34,8 +34,6 @@ summaries and point it at an LLM endpoint of your choice.
 - 🗣️ **Tamil + English + Tanglish**, transcribed and normalized to English by default, with a one-click
   switch to Tanglish spelling or native Tamil script
 - ⚡ **Live, incremental transcription** — no waiting for the recording to end
-- 🧑‍🤝‍🧑 **Recognises who's speaking** — learns voices locally so in-person meetings (one shared
-  microphone) show names, not just "You"/"Remote"
 - ✨ **Optional AI clean-up, summaries and Q&A** — bring your own OpenAI-compatible LLM endpoint
   (DeepSeek, OpenAI, a local Ollama server, whatever you have access to)
 - 🔒 **Local-first by design** — raw audio and transcripts live in a folder on disk; nothing is uploaded
@@ -87,21 +85,16 @@ MeetAssist loads speech models from a local `models/` folder next to the `meetas
 ```
 models/
 ├── ct2-small/           # faster-whisper small, CTranslate2 format (required)
-├── indic-asr/
-│   └── assets/
-│       ├── encoder.onnx     # AI4Bharat IndicConformer (required for Tamil/hybrid mode)
-│       └── ctc_decoder.onnx
-└── speaker-id/
-    └── campplus_sv_zh_en_16k-common_advanced.onnx   # optional: lets MeetAssist recognise voices
+└── indic-asr/
+    └── assets/
+        ├── encoder.onnx     # AI4Bharat IndicConformer (required for Tamil/hybrid mode)
+        └── ctc_decoder.onnx
 ```
 
 - `ct2-small` — download from [`Systran/faster-whisper-small`](https://huggingface.co/Systran/faster-whisper-small)
   (swap in `faster-whisper-medium` or `-large-v3-turbo` under `models/ct2-<size>/` for more accuracy at the
   cost of speed; pick the active one in Settings).
 - `indic-asr` — download from [`ai4bharat/indic-conformer-600m-multilingual`](https://huggingface.co/ai4bharat/indic-conformer-600m-multilingual).
-- `speaker-id` — optional; without it, speaker naming/recognition is silently disabled. Download from
-  the [sherpa-onnx `speaker-recongition-models` release](https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-recongition-models)
-  (`3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`, ~28 MB).
 
 If `huggingface.co` is blocked on your network, both are also mirrored on
 [ModelScope](https://modelscope.cn) — `tools/ms_download.py <owner/name> <dest_dir>` fetches a ModelScope
@@ -144,14 +137,11 @@ python -m meetassist.app
 | **Ask** | Ask free-form questions about a meeting; answered from its transcript + summary. |
 | **Re-transcribe** | Re-run speech recognition on the saved audio with a different model; the previous transcript is kept as a backup. |
 | Right-click a meeting | Rename, open its folder, or delete it (deletes the audio too). |
-| **Settings → Voices** | Record a 10-second sample to recognise your own voice, and name/rename/remove other recognised speakers. MeetAssist also asks once, on first use, whether to learn your voice. |
 
 ## Where things are stored
 
 - Meetings, transcripts and raw audio: `%LOCALAPPDATA%\MeetAssist\meetings\<date-time>\`
-  (`raw\` = audio, `journal.jsonl` = transcript, `speakers.json` = recognised-speaker labels, `exports\` = saved files).
-- Recognised voice profiles (one entry per person MeetAssist has learned to recognise, by name):
-  `%LOCALAPPDATA%\MeetAssist\voices.json`.
+  (`raw\` = audio, `journal.jsonl` = transcript, `exports\` = saved files).
 - Settings: `%LOCALAPPDATA%\MeetAssist\settings.json` — the LLM API key is stored encrypted for your
   Windows user account.
 - Raw audio is only ever deleted when **you** delete the meeting.
@@ -166,10 +156,6 @@ Speech recognition is 100% local. The app makes **no network connection** at all
 you configure yourself, and only when you click *Clean up* / *Summarize* / *Ask* (or opt in to automatic
 clean-up). Before the first recording the app reminds you to make sure the meeting may be recorded —
 check your own organization's recording/compliance policy before recording calls that aren't just yours.
-
-Voice recognition (naming a speaker once so MeetAssist recognises them later) runs the same way: the
-speaker-embedding model and all matching/clustering happen locally in `meetassist/voiceid.py`, nothing
-about anyone's voice is ever sent anywhere, and the resulting voice profiles never leave your machine.
 
 ## Architecture
 

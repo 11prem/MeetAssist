@@ -154,7 +154,7 @@ def test_journal_append_after_torn_last_line_starts_a_new_line(tmp_path):
 
 
 def test_delete_with_an_open_memmap_keeps_the_meeting_listed_and_retryable(tmp_path, monkeypatch):
-    """An open handle on raw audio (voice ID's memmap) must not leave a hidden folder still holding the pcm."""
+    """An open handle on raw audio (e.g. a memmap) must not leave a hidden folder still holding the pcm."""
     monkeypatch.setattr(paths, "MEETINGS_DIR", tmp_path / "m")
     d = store.new_meeting("busy")
     (d / "raw" / "mic.pcm").write_bytes(np.ones(1000, np.int16).tobytes()); (d / "journal.jsonl").write_text("{}\n")

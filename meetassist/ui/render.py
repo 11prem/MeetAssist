@@ -19,7 +19,7 @@ def transcript_html(groups: List[dict], p: theme.Palette) -> str:
     out = []
     for g in groups:
         col = p.you if g["track"] == "mic" else p.remote if g["track"] == "loop" else p.text2
-        who = g.get("who") or SPEAKER.get(g["track"], g["track"])
+        who = SPEAKER.get(g["track"], g["track"])
         out.append(
             f"<div style='margin:0 0 20px 0'>"
             f"<p style='margin:0 0 3px 0'><span style='color:{col};font-weight:600;font-size:13px'>{who}</span>"

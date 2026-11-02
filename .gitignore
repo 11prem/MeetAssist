@@ -5,10 +5,6 @@ models/
 *.m4a
 *.mp3
 audio/
-# voice recordings / recognition data belong on the user's machine only (%LOCALAPPDATA%), never here -
-# these two patterns are belt-and-suspenders in case a local dev ever points MEETASSIST_DATA_DIR at the repo
-voices.json
-speakers.json
 __pycache__/
 *.pyc
 .venv/

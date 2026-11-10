@@ -107,7 +107,7 @@ class LLMClient:
     def _request(self, messages: list, temperature: float, max_tokens: int) -> str:
         if not self.available:
             raise LLMError("LLM base URL / API key not configured (Settings).")
-        body = json.dumps({"model": self.model, "temperature": temperature, "max_tokens": max_tokens, "messages": messages}).encode("utf-8")
+        body = json.dumps({"model": self.model, "max_tokens": max_tokens, "messages": messages}).encode("utf-8")
         req = urllib.request.Request(_endpoint(self.base_url), data=body, method="POST", headers={
             "Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"})
         last: Optional[Exception] = None
